@@ -1,0 +1,17 @@
+From: 高翔 <gaoxiang@beichen-mfg.com>
+To: 陈晓 <chenxiao@beichen-mfg.com>; 周斌 <zhoubin@beichen-mfg.com>
+Subject: Subject: 新元电子 POC 沟通纪要（10/20）
+Date: 2026-10-20 18:42
+MIME-Version: 1.0
+Content-Type: text/plain; charset="utf-8"
+
+
+今天和新元电子 IT 总监张总、生产部李经理聊了两小时。
+关注点：
+1. 他们有 180 台设备，主要是 SMT 产线，协议以 OPC UA 为主。
+2. 最关心的是换线时间统计，我们现在没有现成报表，需要定制。
+3. 预算大概 60 万，但要走集团采购流程，周期可能 3 个月。
+
+需要产品部确认：换线时间报表能否放进 V3.2.2？如果不能，POC 阶段怎么答复。
+
+高翔

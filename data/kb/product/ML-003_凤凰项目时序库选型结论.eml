@@ -1,0 +1,16 @@
+From: 陈晓 <chenxiao@beichen-mfg.com>
+To: 李维 <liwei@beichen-mfg.com>; 周航 <zhouhang@beichen-mfg.com>
+Subject: Subject: 凤凰项目时序库选型结论
+Date: 2026-09-23 11:40
+MIME-Version: 1.0
+Content-Type: text/plain; charset="utf-8"
+
+
+两位：
+昨天架构评审后，时序库定为 TDengine，理由三条：
+1. 压缩比实测比 InfluxDB 高约 30%，12 亿条数据存储成本差不少；
+2. 国产化要求，客户侧信创适配更容易过；
+3. 社区版功能够用，不涉及授权费用。
+风险也记录一下：团队没人用过，学习成本要算进去；另外集群版是商业授权，如果客户要三副本，得走采购。
+迁移方案下周单独讨论。
+陈晓

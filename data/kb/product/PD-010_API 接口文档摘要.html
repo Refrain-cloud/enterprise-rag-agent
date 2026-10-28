@@ -1,0 +1,11 @@
+<!DOCTYPE html><html lang="zh-CN"><head><meta charset="utf-8">
+<title>API 接口文档摘要</title></head><body>
+<h1>北辰云 API 接口文档（摘要）</h1>
+<p>完整文档见开发者门户 dev.beichen-mfg.com。</p>
+<h2>认证</h2>
+<p>所有接口使用 Bearer Token，Token 有效期 2 小时，通过 /api/v3/auth/token 获取。</p>
+<h2>主要资源</h2>
+<table border='1'><tr><td>资源</td><td>方法</td><td>路径</td></tr><tr><td>工单</td><td>GET</td><td>/api/v3/workorders</td></tr><tr><td>工单</td><td>POST</td><td>/api/v3/workorders</td></tr><tr><td>报工</td><td>POST</td><td>/api/v3/workorders/{id}/report</td></tr><tr><td>设备</td><td>GET</td><td>/api/v3/devices</td></tr><tr><td>设备数据</td><td>GET</td><td>/api/v3/devices/{id}/telemetry</td></tr><tr><td>物料</td><td>GET</td><td>/api/v3/materials</td></tr></table>
+<h2>限流</h2>
+<p>单租户 600 次/分钟，超出返回 429。</p>
+</body></html>

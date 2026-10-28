@@ -1,0 +1,7 @@
+﻿主机名,用途,配置,机房,负责人
+bc-prod-app-01,MES 应用节点,16C/64G,常州电信,钱伟
+bc-prod-app-02,MES 应用节点,16C/64G,常州电信,钱伟
+bc-prod-db-01,PostgreSQL 主库,32C/128G,常州电信,钱伟
+bc-prod-db-02,PostgreSQL 备库,32C/128G,常州电信,钱伟
+bc-prod-mq-01,消息队列,8C/32G,常州电信,钱伟
+bc-prod-oss-01,对象存储,8C/32G + 20T,常州电信,钱伟
