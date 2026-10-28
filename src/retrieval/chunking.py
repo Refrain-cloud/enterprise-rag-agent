@@ -4,6 +4,9 @@ import re
 
 from src.config import CHUNK_OVERLAP, CHUNK_SIZE
 
+TABLE_FORMATS = {"csv", "xlsx"}
+TABLE_CHUNK_SIZE = 2200
+
 
 def _split_long(block: str, size: int) -> list[str]:
     if len(block) <= size:
@@ -51,7 +54,9 @@ def split_text(text: str, size: int = CHUNK_SIZE, overlap: int = CHUNK_OVERLAP) 
 
 def chunk_doc(doc: dict) -> list[dict]:
     chunks: list[dict] = []
-    for index, text in enumerate(split_text(doc["text"])):
+    # 表格整表保留：拆开后模型容易只看到部分行，导致统计漏项。
+    size = TABLE_CHUNK_SIZE if doc["format"] in TABLE_FORMATS else CHUNK_SIZE
+    for index, text in enumerate(split_text(doc["text"], size=size)):
         metadata = {
             "doc_id": doc["doc_id"],
             "title": doc["title"],
