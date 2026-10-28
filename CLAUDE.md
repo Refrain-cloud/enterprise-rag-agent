@@ -54,8 +54,13 @@ build/          派生索引与中间产物（不入库）
 
 ```bash
 python -m pip install -r requirements.txt
-# 以下命令随 M1 实现补充：解析入库、建索引、跑评估、启动 API
+python -m src.ingest.build_corpus          # 解析 data/kb → build/corpus
+python -m src.retrieval.index --rebuild    # 分块、embedding、Chroma、BM25
+python -m src.agent.ask "员工年假几天？" --role 普通员工
+python -m eval.run_eval                    # 30 题 baseline + LLM judge
 ```
+
+Windows 控制台输出中文时加 `PYTHONIOENCODING=utf-8`，否则可能乱码。
 
 ## Git 工作流
 
