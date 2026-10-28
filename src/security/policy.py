@@ -37,10 +37,7 @@ def can_access(role: str, meta: dict) -> bool:
     doc_dept = meta.get("dept", "")
 
     if classification == "internal":
-        if scope == "company":
-            return True
-        if scope.startswith("dept:"):
-            return dept is not None and scope.split(":", 1)[1] == dept
+        # internal = 公司内部公开；dept:XX 只表示归档部门，不限制跨部门阅读。
         return True
 
     if classification == "confidential":

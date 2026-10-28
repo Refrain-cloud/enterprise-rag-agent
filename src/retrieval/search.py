@@ -33,6 +33,7 @@ def _load_resources():
     return by_id, bm25_payload, collection
 
 
+@lru_cache(maxsize=128)
 def _embed_query(query: str) -> list[float]:
     response = get_client().embeddings.create(
         model=EMBED_MODEL, input=[query], dimensions=EMBED_DIM
