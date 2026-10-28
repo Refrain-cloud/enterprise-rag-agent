@@ -1,0 +1,28 @@
+# Secrets
+.env
+.env.*
+*.key
+*.pem
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+*.egg-info/
+dist/
+
+# Derived artifacts
+build/
+*.log
+
+# Local Claude settings
+.claude/settings.local.json
+
+# OS / IDE
+.DS_Store
+Thumbs.db
+.idea/
