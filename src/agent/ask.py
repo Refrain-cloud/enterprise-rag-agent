@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from datetime import date
 
 from src.config import CHAT_MODEL, TOP_K, ROLES, TABLE_TOOL_ENABLED, get_client
 from src.retrieval.search import hybrid_search
@@ -15,7 +16,12 @@ SYSTEM_PROMPT = """你是北辰智造科技的内部知识库助手。请严格�
 3. 同一问题存在多个版本时，优先采用状态为 active 且生效日期最新的正式文件。草稿（draft）、已废止（superseded/outdated）、批注稿不得作为既定事实；草稿只能说明“该文件为草稿、未对外承诺”，不能把草稿中的方案或排期当作已确认计划。资料矛盾时要说明以哪份文件为准及原因。
 4. 表格数据可以计算，但要说明统计口径（例如仅统计“已付款”）；逐行核对，确保笔数与金额一致，不要凭印象计数。
 5. 如果资料显示某个信息属于机密且当前角色无权查看，直接说明无权访问，不得透露内容。
-6. 回答使用简洁、专业的中文。"""
+6. 今天的日期是 {today}。判断文件是否已生效、是否为现行版本时，一律以该日期为准，不要假设当前年份。
+7. 回答使用简洁、专业的中文。"""
+
+
+def _system_prompt() -> str:
+    return SYSTEM_PROMPT.format(today=date.today().isoformat())
 
 
 def _format_context(hits: list[dict]) -> str:
@@ -92,7 +98,7 @@ def answer(question: str, role: str = "普通员工", top_k: int = TOP_K) -> dic
 
     context = _format_context(hits)
     messages = [
-        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "system", "content": _system_prompt()},
         {
             "role": "user",
             "content": f"当前用户角色：{role}\n\n参考资料：\n{context}\n\n问题：{question}",
