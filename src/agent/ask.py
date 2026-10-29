@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import argparse
 
-from src.config import CHAT_MODEL, TOP_K, ROLES, get_client
+from src.config import CHAT_MODEL, TOP_K, ROLES, TABLE_TOOL_ENABLED, get_client
 from src.retrieval.search import hybrid_search
 from src.security.policy import can_access, normalize_role
+from src.tools.sql_tool import answer_with_tables
 
 SYSTEM_PROMPT = """你是北辰智造科技的内部知识库助手。请严格依据提供的资料回答。
 
@@ -59,6 +60,7 @@ def answer(question: str, role: str = "普通员工", top_k: int = TOP_K) -> dic
             "sources": [],
             "hits": [],
             "denied": True,
+            "route": "rag",
         }
 
     if not hits:
@@ -69,12 +71,24 @@ def answer(question: str, role: str = "普通员工", top_k: int = TOP_K) -> dic
             "sources": [],
             "hits": [],
             "denied": False,
+            "route": "rag",
         }
 
     # 最优匹配是外部门机密时直接拒答，避免模型用关联的公开资料拼凑敏感信息。
     if best_overall and not can_access(role, best_overall[0]["metadata"]):
         if str(best_overall[0]["metadata"].get("scope", "")).startswith("dept:"):
             return _denied()
+
+    if TABLE_TOOL_ENABLED:
+        tool_result = answer_with_tables(question, role, hits)
+        if tool_result:
+            used_doc_ids = set(tool_result.get("table_doc_ids", []))
+            tool_result["hits"] = hits
+            tool_result["sources"] = _sources(
+                [hit for hit in hits if hit["metadata"]["doc_id"] in used_doc_ids]
+            )
+            tool_result["denied"] = False
+            return tool_result
 
     context = _format_context(hits)
     messages = [
@@ -95,6 +109,7 @@ def answer(question: str, role: str = "普通员工", top_k: int = TOP_K) -> dic
         "sources": _sources(hits),
         "hits": hits,
         "denied": False,
+        "route": "rag",
     }
 
 
@@ -103,9 +118,16 @@ def main() -> None:
     parser.add_argument("question", nargs="+", help="要提问的问题")
     parser.add_argument("--role", default="普通员工", choices=ROLES)
     parser.add_argument("--top-k", type=int, default=TOP_K)
+    parser.add_argument("--debug", action="store_true", help="打印路由与 SQL")
     args = parser.parse_args()
     result = answer(" ".join(args.question), role=args.role, top_k=args.top_k)
     print(result["answer"])
+    if args.debug:
+        print(f"\n[route] {result.get('route', '?')}")
+        if result.get("sql"):
+            print(f"[sql] {result['sql']}")
+        if result.get("sql_result"):
+            print(f"[rows] {result['sql_result']['row_count']}")
     if result["sources"]:
         print("\n来源：")
         for source in result["sources"]:

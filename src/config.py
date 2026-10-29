@@ -26,6 +26,19 @@ CANDIDATE_K = int(os.getenv("RAG_CANDIDATE_K", "40"))
 
 ROLES = ("普通员工", "HR", "财务", "销售", "IT", "产品", "管理层")
 
+TABLE_TOOL_ENABLED = os.getenv("RAG_TABLE_TOOL", "1") not in {"0", "false", "False"}
+TABLE_FORMATS = {"csv", "xlsx"}
+AGG_KEYWORDS = (
+    "合计", "总计", "总共", "一共", "几笔", "几单",
+    "最高", "最低", "最多", "最少", "平均", "统计", "汇总", "占比",
+)
+TABLE_MAX_DOCS = int(os.getenv("RAG_TABLE_MAX_DOCS", "3"))
+TABLE_MAX_ROWS = int(os.getenv("RAG_TABLE_MAX_ROWS", "200"))
+TABLE_HEADER_SCAN_ROWS = 10
+TABLE_SAMPLE_ROWS = 3
+TABLE_RESULT_PROMPT_ROWS = 20
+TABLE_SQL_MAX_TOKENS = 400
+
 
 def get_api_key() -> str:
     key = os.getenv("DASHSCOPE_API_KEY") or os.getenv("OPENAI_API_KEY")

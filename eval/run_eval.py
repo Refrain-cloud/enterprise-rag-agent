@@ -4,7 +4,7 @@ import argparse
 import json
 import re
 import time
-from collections import defaultdict
+from collections import Counter, defaultdict
 from datetime import datetime
 from pathlib import Path
 
@@ -102,7 +102,13 @@ def evaluate(limit: int | None, use_judge: bool) -> dict:
         try:
             response = answer(question["question"], role=question["role"])
         except Exception as exc:
-            response = {"answer": f"ERROR: {exc}", "sources": [], "hits": [], "denied": False}
+            response = {
+                "answer": f"ERROR: {exc}",
+                "sources": [],
+                "hits": [],
+                "denied": False,
+                "route": "error",
+            }
 
         retrieved_ids = [hit["metadata"]["doc_id"] for hit in response["hits"]]
         gold_ids = question.get("gold_doc_ids", [])
@@ -145,6 +151,10 @@ def evaluate(limit: int | None, use_judge: bool) -> dict:
             "auto_refusal": auto_refusal,
             "leaked_ids": leaked_ids,
             "leaked_terms": leaked_terms,
+            "route": response.get("route", "rag"),
+            "sql": response.get("sql"),
+            "sql_row_count": (response.get("sql_result") or {}).get("row_count"),
+            "table_doc_ids": response.get("table_doc_ids", []),
             "judge": judged,
             "latency_s": round(time.time() - started, 2),
         }
@@ -198,6 +208,7 @@ def evaluate(limit: int | None, use_judge: bool) -> dict:
                 if items_with_gold else None
             ),
             "avg_score": sum(scores) / len(scores) if scores else None,
+            "routes": dict(sorted(Counter(item["route"] for item in items).items())),
         }
 
     report = {
@@ -212,6 +223,7 @@ def evaluate(limit: int | None, use_judge: bool) -> dict:
             "refusal_accuracy": refusal_accuracy,
             "permission_ok_rate": permission_ok,
             "permission_leaks": len(permission_leaks),
+            "route_counts": dict(sorted(Counter(result["route"] for result in results).items())),
         },
         "by_category": category_metrics,
         "results": results,
@@ -242,11 +254,12 @@ def _write_markdown(report: dict) -> None:
         f"- 拒答正确率：{metrics['refusal_accuracy']}",
         f"- 权限合规率：{metrics['permission_ok_rate']}",
         f"- 权限泄漏数：{metrics['permission_leaks']}",
+        f"- 路由分布：{metrics['route_counts']}",
         "",
         "## 分类指标",
         "",
-        "| 类别 | 题数 | 检索 Recall | 平均分 |",
-        "|---|---|---|---|",
+        "| 类别 | 题数 | 检索 Recall | 平均分 | 路由 |",
+        "|---|---|---|---|---|",
     ]
     for category, metric in report["by_category"].items():
         recall = metric["retrieval_recall"]
@@ -256,17 +269,19 @@ def _write_markdown(report: dict) -> None:
             f"{recall:.3f} | " if recall is not None else f"| {category} | {metric['count']} | - | "
         )
         lines[-1] += f"{avg:.2f} |" if avg is not None else "- |"
+        lines[-1] += f" {metric['routes']} |"
     lines.extend([
         "",
         "## 题目明细",
         "",
-        "| ID | 类别 | 角色 | 检索命中 | 引用命中 | 得分 | 泄漏 |",
-        "|---|---|---|---|---|---|---|",
+        "| ID | 类别 | 角色 | 路由 | 检索命中 | 引用命中 | 得分 | 泄漏 |",
+        "|---|---|---|---|---|---|---|---|",
     ])
     for result in report["results"]:
         leaks = ",".join(result["leaked_ids"] + result["leaked_terms"]) or "-"
         lines.append(
             f"| {result['id']} | {result['category']} | {result['role']} | "
+            f"{result['route']} | "
             f"{'Y' if result['retrieval_hit'] else 'N'} | "
             f"{'Y' if result['cites_gold'] else 'N'} | "
             f"{result['judge']['score']} | {leaks} |"
