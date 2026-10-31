@@ -24,13 +24,23 @@ def _system_prompt() -> str:
     return SYSTEM_PROMPT.format(today=date.today().isoformat())
 
 
+def _status_label(status: str) -> str:
+    if status == "draft":
+        return "draft（草稿，未对外承诺，不得当作已确认计划）"
+    if status == "superseded":
+        return "superseded（已废止，不得作为现行依据）"
+    if status == "outdated":
+        return "outdated（旧版/已过期，不得作为现行依据）"
+    return status
+
+
 def _format_context(hits: list[dict]) -> str:
     blocks = []
     for index, hit in enumerate(hits, 1):
         meta = hit["metadata"]
         blocks.append(
             f"[资料 {index}] doc_id={meta['doc_id']} | 标题={meta['title']} | "
-            f"版本={meta['version']} | 状态={meta['status']} | "
+            f"版本={meta['version']} | 状态={_status_label(meta['status'])} | "
             f"生效日期={meta['effective_date']} | 密级={meta['classification']} | "
             f"路径={meta['path']}\n{hit['text']}"
         )

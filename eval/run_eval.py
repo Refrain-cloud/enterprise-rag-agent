@@ -217,7 +217,12 @@ def _norm(text: str) -> str:
 
 def _canon(text: str) -> str:
     normalized = _norm(text)
-    for variant, canonical in (("不可以", "不能"), ("不可", "不能"), ("不予", "不能")):
+    for variant, canonical in (
+        ("不可以", "不能"),
+        ("不可", "不能"),
+        ("不予", "不能"),
+        ("没有", "无"),
+    ):
         normalized = normalized.replace(variant, canonical)
     # 统一配置/单位的常见写法：8C ≡ 8 核，32G ≡ 32GB，2T ≡ 2TB；草稿中英混用
     for variant, canonical in (("GB", "G"), ("TB", "T"), ("核", "C"), ("draft", "草稿")):
@@ -469,6 +474,15 @@ def _assemble_judgement(
     statuses = [fact["status"] for fact in facts]
     covered = any(status == "covered" for status in statuses)
     wrong = any(status == "wrong" for status in statuses)
+    # 非拒答题中顺带一句“无权访问某关联资料”不等于拒答：必答事实点全部覆盖且无矛盾时按实质回答计分
+    if (
+        not expect_refusal
+        and refused
+        and facts
+        and all(status == "covered" for status in statuses)
+        and not contradictions
+    ):
+        refused = False
 
     if expect_refusal:
         score = 2 if refused else 0

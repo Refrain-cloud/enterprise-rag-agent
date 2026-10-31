@@ -35,17 +35,18 @@ SQL_SYSTEM_PROMPT = """你是 SQLite SQL 专家，负责把内部统计问题转
 3. 以 _summary 结尾的表存放合计/小计等汇总行：明细的 SUM/COUNT/MAX/MIN/排序必须查明细表；问“整体/合计/汇总”时才用 _summary 表。问题含多个小问或同时问整体与排名时，一条查询要返回足够的数据（例如明细排行 + 汇总值），不要只查汇总行。
 4. 百分比列存的是百分点（77.5 表示 77.5%）；整体执行率优先用 _summary，或用 累计/预算 计算。
 5. 金额列是数值，空值为 NULL；需要保留行明细时不要省略列。
-6. 结果行数用 LIMIT 50 限制。
-7. 问“最高/最低/最多/最少”时，查询结果必须包含该行对应的数值（如执行率），不能只返回名称。
+6. 结果行数用 LIMIT 50 限制；汇总行与排名行用 UNION ALL 合并时，排名部分的 ORDER BY/LIMIT 必须写在独立子查询里（如 SELECT * FROM (SELECT ... ORDER BY ... LIMIT 1)），否则末尾的 ORDER BY/LIMIT 会把汇总行一起裁掉。
+7. 问“最高/最低/最多/最少”时，必须直接查明细表并返回该行的名称与数值（如 SELECT "成本中心","执行率" ... ORDER BY "执行率" DESC LIMIT 1），不能只返回名称，也不要用子查询只取名称。
 8. 问“超过 N 天/大于 N”时，条件要覆盖所有更高档位：例如账龄超过 90 天应同时包含“90天以上”和“180天以上”，不能只等值匹配一档；“—”或空值不计入。"""
 
 RESTATE_SYSTEM_PROMPT = """你负责把数据库查询结果转述成中文回答。
 规则：
-1. 只能使用查询结果中的数字和文字，原样引用，不得自行计算、四舍五入或补充。
+1. 只能使用查询结果和“表外说明”中的数字和文字，原样引用，不得自行计算、四舍五入或补充。
 2. 每个关键数字后标注来源 [文档ID]，文档ID见来源列表。
 3. 简要说明统计口径（筛选条件、时间范围）。
 4. 查询结果为空时回答“未查询到符合条件的记录”，不要猜测。
-5. 简洁专业，不要提及 SQL、数据库、查询语句或 “t_” 开头的内部表名。"""
+5. 简洁专业，不要提及 SQL、数据库、查询语句或 “t_” 开头的内部表名。
+6. 问“原因/为什么/说明”时，若查询结果中的备注较简略，而表外说明中有对应成本中心/科目的解释，必须一并转述，不能只回答简短备注。"""
 
 
 VERSION_MARKERS = (
@@ -168,6 +169,46 @@ def _schema_text(loaded: LoadedTables) -> str:
     return "\n\n".join(blocks)
 
 
+RANK_WORDS = ("最高", "最低", "最多", "最少", "最大", "最小")
+SUMMARY_WORDS = ("整体", "合计", "汇总", "总计", "总共", "一共")
+ENTITY_WORDS = ("成本中心", "项目", "部门", "姓名", "客户", "科目", "产品", "供应商", "职级", "门店", "渠道")
+ENTITY_ASK_WORDS = ("哪个", "哪家", "谁", "哪一个", "哪些")
+
+
+def _numeric_column_count(result: dict) -> int:
+    count = 0
+    for index in range(len(result["columns"])):
+        values = [row[index] for row in result["rows"] if row[index] is not None]
+        if values and all(
+            isinstance(value, (int, float)) and not isinstance(value, bool)
+            for value in values
+        ):
+            count += 1
+    return count
+
+
+def _has_entity_column(result: dict) -> bool:
+    for index, name in enumerate(result["columns"]):
+        if not any(word in name for word in ENTITY_WORDS):
+            continue
+        if any(row[index] not in (None, "") for row in result["rows"]):
+            return True
+    return False
+
+
+def _insufficient_rank_result(question: str, result: dict) -> bool:
+    if not (
+        any(word in question for word in RANK_WORDS)
+        and any(word in question for word in SUMMARY_WORDS)
+    ):
+        return False
+    if result["row_count"] < 2 and _numeric_column_count(result) < 2:
+        return True
+    return any(word in question for word in ENTITY_ASK_WORDS) and not _has_entity_column(
+        result
+    )
+
+
 def generate_sql(question: str, loaded: LoadedTables, conn: sqlite3.Connection) -> tuple[str, dict]:
     messages = [
         {"role": "system", "content": SQL_SYSTEM_PROMPT},
@@ -177,7 +218,8 @@ def generate_sql(question: str, loaded: LoadedTables, conn: sqlite3.Connection) 
         },
     ]
     last_error: Exception | None = None
-    for attempt in range(2):
+    fallback: tuple[str, dict] | None = None
+    for attempt in range(3):
         response = get_client().chat.completions.create(
             model=CHAT_MODEL,
             messages=messages,
@@ -187,17 +229,40 @@ def generate_sql(question: str, loaded: LoadedTables, conn: sqlite3.Connection) 
         raw = response.choices[0].message.content.strip()
         try:
             sql = sanitize_sql(raw)
-            return sql, run_select(conn, sql)
+            result = run_select(conn, sql)
         except Exception as exc:
             last_error = exc
-            if attempt == 0:
-                messages.append({"role": "assistant", "content": raw})
-                messages.append(
-                    {
-                        "role": "user",
-                        "content": f"上面的 SQL 无法执行：{exc}\n请修正后只输出一条 SELECT 语句。",
-                    }
-                )
+            messages.append({"role": "assistant", "content": raw})
+            messages.append(
+                {
+                    "role": "user",
+                    "content": f"上面的 SQL 无法执行：{exc}\n请修正后只输出一条 SELECT 语句。",
+                }
+            )
+            continue
+        # 同时问整体与排名时，结果必须同时有汇总值、排名对象的名称和数值
+        if _insufficient_rank_result(question, result):
+            fallback = (sql, result)
+            messages.append({"role": "assistant", "content": raw})
+            messages.append(
+                {
+                    "role": "user",
+                    "content": (
+                        "结果缺少排名对象的名称或汇总数值（也可能被末尾的 ORDER BY/LIMIT 裁掉了）。"
+                        "请用 UNION ALL 在同一结果中返回汇总行和排名行，例如：\n"
+                        "SELECT '汇总' AS 类型, \"成本中心\", \"执行率\", \"备注\" FROM 汇总表\n"
+                        "UNION ALL\n"
+                        "SELECT '最高' AS 类型, * FROM (SELECT \"成本中心\", \"执行率\", \"备注\" "
+                        "FROM 明细表 ORDER BY \"执行率\" DESC LIMIT 1)\n"
+                        "排名行必须同时含名称列（如 \"成本中心\"，值如 实施 CC-IM）和数值列（如 \"执行率\"，值如 81.1）。"
+                        "ORDER BY/LIMIT 只能写在括号内的子查询里，不能写在 UNION ALL 末尾。"
+                    ),
+                }
+            )
+            continue
+        return sql, result
+    if fallback is not None:
+        return fallback
     raise RuntimeError(f"SQL 生成失败：{last_error}")
 
 
