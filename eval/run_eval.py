@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
+import os
 import re
 import time
 from collections import Counter, defaultdict
@@ -18,6 +20,63 @@ REPORT_DIR = BUILD_DIR / "eval"
 CORPUS_PATH = BUILD_DIR / "corpus" / "docs.jsonl"
 CITE_PATTERN = re.compile(r"\[([A-Z]+-\d+[A-Z]?)\]")
 FULL_DOC_CHARS = 12000
+
+ROOT = Path(__file__).resolve().parents[1]
+# 只覆盖运行期影响回答的代码与派生索引；改 ingest/api/ui 不会让已存回答失效
+ANSWER_SOURCE_DIRS = ("agent", "retrieval", "security", "tools")
+ANSWER_SOURCE_FILES = (
+    *sorted(
+        path
+        for name in ANSWER_SOURCE_DIRS
+        for path in (ROOT / "src" / name).rglob("*.py")
+    ),
+    ROOT / "src" / "config.py",
+    BUILD_DIR / "corpus" / "docs.jsonl",
+    BUILD_DIR / "index" / "chunks.jsonl",
+    BUILD_DIR / "index" / "bm25.pkl",
+    BUILD_DIR / "index" / "build_summary.json",
+)
+
+
+def _hash_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for block in iter(lambda: handle.read(1 << 20), b""):
+            digest.update(block)
+    return digest.hexdigest()[:16]
+
+
+@lru_cache(maxsize=1)
+def _answer_fingerprint() -> str:
+    """回答指纹：代码、索引产物或 RAG_* 环境变量任一变化，已存回答即失效。"""
+    parts = [
+        f"{path.relative_to(ROOT)}:{_hash_file(path)}"
+        for path in ANSWER_SOURCE_FILES
+        if path.exists()
+    ]
+    env = {key: value for key, value in os.environ.items() if key.startswith("RAG_")}
+    if env:
+        parts.append("env:" + json.dumps(env, ensure_ascii=False, sort_keys=True))
+    return hashlib.sha256("\n".join(parts).encode("utf-8")).hexdigest()[:16]
+
+
+@lru_cache(maxsize=1)
+def _judge_code_fingerprint() -> str:
+    return _hash_file(Path(__file__).resolve())
+
+
+def _judge_fingerprint(question: dict) -> str:
+    """判定指纹：judge 代码 + 该题必答点/标准答案，key_facts 改动可被发现。"""
+    payload = {
+        "code": _judge_code_fingerprint(),
+        "key_facts": question.get("key_facts") or [],
+        "gold_answer": question.get("gold_answer", ""),
+        "category": question.get("category", ""),
+        "expect_refusal": question.get("expect_refusal", False),
+    }
+    return hashlib.sha256(
+        json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
+    ).hexdigest()[:16]
 
 REFUSAL_MARKERS = [
     "无权", "无法访问", "无法回答", "无法确定", "无法判断", "不能提供",
@@ -501,6 +560,9 @@ def evaluate(
     use_judge: bool,
     questions_path: Path | None = None,
     ids: set[str] | None = None,
+    output_stem: str | None = None,
+    results_name: str | None = None,
+    write: bool = True,
 ) -> dict:
     REPORT_DIR.mkdir(parents=True, exist_ok=True)
     source_path = questions_path or QUESTIONS_PATH
@@ -510,6 +572,7 @@ def evaluate(
     if limit:
         questions = questions[:limit]
 
+    answer_fp = _answer_fingerprint()
     results: list[dict] = []
     for index, question in enumerate(questions, 1):
         print(f"[{index}/{len(questions)}] {question['id']} {question['question']}")
@@ -576,6 +639,8 @@ def evaluate(
             "sql_row_count": (response.get("sql_result") or {}).get("row_count"),
             "table_doc_ids": response.get("table_doc_ids", []),
             "judge": judged,
+            "answer_fingerprint": answer_fp,
+            "judge_fingerprint": _judge_fingerprint(question),
             "latency_s": round(time.time() - started, 2),
         }
         results.append(result)
@@ -587,19 +652,42 @@ def evaluate(
         )
 
     report = _aggregate(results, str(source_path))
-    if ids:
-        _write_outputs(report, REPORT_DIR, "report_partial", "results_partial.jsonl")
-    else:
-        _write_outputs(report, REPORT_DIR, "report", "results.jsonl")
+    if write:
+        stem = output_stem or ("report_partial" if ids else "report")
+        name = results_name or ("results_partial.jsonl" if ids else "results.jsonl")
+        _write_outputs(report, REPORT_DIR, stem, name)
     return report
 
 
-def rejudge(results_path: Path, limit: int | None, ids: set[str] | None = None) -> dict:
+def rejudge(
+    results_path: Path,
+    limit: int | None,
+    ids: set[str] | None = None,
+    allow_stale: bool = False,
+) -> dict:
     rows = [json.loads(line) for line in results_path.open(encoding="utf-8")]
     if ids:
         rows = [row for row in rows if row["id"] in ids]
     if limit:
         rows = rows[:limit]
+
+    current_fp = _answer_fingerprint()
+    unverified = [
+        row["id"] for row in rows if row.get("answer_fingerprint") != current_fp
+    ]
+    if unverified:
+        preview = ", ".join(sorted(unverified)[:5])
+        suffix = "…" if len(unverified) > 5 else ""
+        print(
+            f"  WARN: {len(unverified)} 条回答无法证明由当前代码/索引生成"
+            f"（{preview}{suffix}）",
+            flush=True,
+        )
+        if not allow_stale:
+            raise SystemExit(
+                "已存回答已过期或缺少指纹：先全量重生成；"
+                "确认只验证 judge 时再加 --allow-stale。"
+            )
 
     results: list[dict] = []
     for index, row in enumerate(rows, 1):
@@ -620,7 +708,9 @@ def rejudge(results_path: Path, limit: int | None, ids: set[str] | None = None) 
             full_docs=_full_docs_context(row["model_answer"], row["gold_doc_ids"]),
             leaked=bool(row.get("leaked_ids") or row.get("leaked_terms")),
         )
-        results.append({**row, "judge": judged})
+        results.append(
+            {**row, "judge": judged, "judge_fingerprint": _judge_fingerprint(row)}
+        )
         print(
             f"  score={judged['score']} faithful={judged['faithful']} "
             f"unsupported={len(judged['unsupported_claims'])}"
@@ -686,10 +776,35 @@ def _aggregate(results: list[dict], source: str) -> dict:
             "routes": dict(sorted(Counter(item["route"] for item in items).items())),
         }
 
+    answer_fingerprints = sorted(
+        {
+            result["answer_fingerprint"]
+            for result in results
+            if result.get("answer_fingerprint")
+        }
+    )
+    judge_fingerprints = sorted(
+        {
+            result["judge_fingerprint"]
+            for result in results
+            if result.get("judge_fingerprint")
+        }
+    )
+
     return {
         "generated_at": datetime.now().isoformat(timespec="seconds"),
         "questions_file": source,
         "question_count": len(results),
+        "fingerprints": {
+            "answer": answer_fingerprints,
+            "judge": judge_fingerprints,
+            "missing_answer": sum(
+                1 for result in results if not result.get("answer_fingerprint")
+            ),
+            "missing_judge": sum(
+                1 for result in results if not result.get("judge_fingerprint")
+            ),
+        },
         "metrics": {
             "retrieval_recall": retrieval_recall,
             "mrr": mrr,
@@ -723,8 +838,9 @@ def _write_outputs(report: dict, directory: Path, stem: str, results_name: str) 
 
 def _write_markdown(report: dict, path: Path) -> None:
     metrics = report["metrics"]
+    fingerprints = report.get("fingerprints") or {}
     lines = [
-        "# Baseline 评估报告",
+        "# 评估报告",
         "",
         f"- 生成时间：{report['generated_at']}",
         f"- 题目数：{report['question_count']}",
@@ -739,6 +855,14 @@ def _write_markdown(report: dict, path: Path) -> None:
         f"- 权限合规率：{metrics['permission_ok_rate']}",
         f"- 权限泄漏数：{metrics['permission_leaks']}",
         f"- 路由分布：{metrics['route_counts']}",
+        f"- 回答指纹：{', '.join(fingerprints.get('answer') or []) or '-'}",
+        f"- 判定指纹：{', '.join(fingerprints.get('judge') or []) or '-'}",
+        *(
+            ["- **注意**：结果包含多代回答或缺少生成指纹，不是纯净基线。"]
+            if len(fingerprints.get("answer") or []) > 1
+            or fingerprints.get("missing_answer")
+            else []
+        ),
         "",
         "## 分类指标",
         "",
@@ -775,6 +899,189 @@ def _write_markdown(report: dict, path: Path) -> None:
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
+def merge_partial(partial_path: Path, baseline_path: Path, ids: set[str]) -> None:
+    if not ids:
+        raise SystemExit("--merge-partial 需要 --ids 明确指定要并入的题号")
+    if not partial_path.exists():
+        raise SystemExit(f"找不到 partial 文件：{partial_path}")
+    partial = {
+        row["id"]: row
+        for row in (
+            json.loads(line) for line in partial_path.open(encoding="utf-8")
+        )
+    }
+    missing = sorted(ids - partial.keys())
+    if missing:
+        raise SystemExit(f"partial 文件缺少题号：{missing}")
+
+    baseline = [json.loads(line) for line in baseline_path.open(encoding="utf-8")]
+    baseline_by_id = {row["id"]: row for row in baseline}
+    unknown = sorted(ids - baseline_by_id.keys())
+    if unknown:
+        raise SystemExit(f"基线中不存在题号：{unknown}")
+
+    current_fp = _answer_fingerprint()
+    merged_at = datetime.now().isoformat(timespec="seconds")
+    for qid in sorted(ids):
+        row = partial[qid]
+        if row.get("answer_fingerprint") != current_fp:
+            print(
+                f"  WARN: {qid} 的回答也不是当前代码生成"
+                f"（{row.get('answer_fingerprint') or '无指纹'} != {current_fp}）"
+            )
+        baseline_by_id[qid] = {
+            **row,
+            "provenance": "partial_regenerated",
+            "merged_at": merged_at,
+        }
+
+    baseline_path.write_text(
+        "".join(
+            json.dumps(baseline_by_id[row["id"]], ensure_ascii=False) + "\n"
+            for row in baseline
+        ),
+        encoding="utf-8",
+    )
+    fingerprints = sorted(
+        {row.get("answer_fingerprint") or "unknown" for row in baseline_by_id.values()}
+    )
+    print(f"已并入 {len(ids)} 题到 {baseline_path}：{sorted(ids)}")
+    print(f"基线现有 {len(fingerprints)} 种回答指纹：{fingerprints}")
+    if len(fingerprints) > 1 or "unknown" in fingerprints:
+        print("  WARN: 合并后是混合基线，不能当作全量重生成结果引用。")
+
+
+def _select_drift_sample(rows: list[dict], size: int) -> list[str]:
+    by_category: dict[str, list[str]] = defaultdict(list)
+    for row in sorted(rows, key=lambda item: item["id"]):
+        by_category[row["category"]].append(row["id"])
+    selected: list[str] = []
+    categories = sorted(by_category)
+    while len(selected) < size and any(by_category.values()):
+        for category in categories:
+            if by_category[category] and len(selected) < size:
+                selected.append(by_category[category].pop(0))
+    return selected
+
+
+def drift_sample(baseline_path: Path, size: int) -> dict:
+    baseline = [json.loads(line) for line in baseline_path.open(encoding="utf-8")]
+    sample = _select_drift_sample(baseline, size)
+    if not sample:
+        raise SystemExit("基线为空，无法抽样")
+    print(f"漂移抽样 {len(sample)} 题：{', '.join(sample)}")
+
+    regenerated = evaluate(limit=None, use_judge=True, ids=set(sample), write=False)
+    before = {row["id"]: row for row in baseline}
+    after = {row["id"]: row for row in regenerated["results"]}
+    rows = []
+    for qid in sample:
+        old = before[qid]
+        new = after[qid]
+        old_judge = old.get("judge") or {}
+        new_judge = new.get("judge") or {}
+        old_facts = {
+            fact.get("id"): fact.get("status")
+            for fact in old_judge.get("facts") or []
+        }
+        new_facts = {
+            fact.get("id"): fact.get("status")
+            for fact in new_judge.get("facts") or []
+        }
+        rows.append({
+            "id": qid,
+            "category": old["category"],
+            "retrieval_changed": old.get("retrieved_ids") != new.get("retrieved_ids"),
+            "route_changed": old.get("route") != new.get("route"),
+            "answer_changed": _norm(old.get("model_answer", ""))
+            != _norm(new.get("model_answer", "")),
+            "score_before": old_judge.get("score"),
+            "score_after": new_judge.get("score"),
+            "facts_changed": old_facts != new_facts,
+        })
+
+    current_fp = _answer_fingerprint()
+    baseline_fps = {
+        row.get("answer_fingerprint")
+        for row in baseline
+        if row.get("answer_fingerprint")
+    }
+    fingerprint_changed = bool(baseline_fps) and current_fp not in baseline_fps
+    signals = {
+        "fingerprint_changed": fingerprint_changed,
+        "retrieval_changed": sum(1 for row in rows if row["retrieval_changed"]),
+        "route_changed": sum(1 for row in rows if row["route_changed"]),
+        "answer_changed": sum(1 for row in rows if row["answer_changed"]),
+        "score_changed": sum(
+            1 for row in rows if row["score_before"] != row["score_after"]
+        ),
+        "facts_changed": sum(1 for row in rows if row["facts_changed"]),
+    }
+    if fingerprint_changed:
+        verdict = "full_generation"
+        reason = "基线回答指纹与当前代码/索引不一致"
+    elif signals["retrieval_changed"] or signals["route_changed"]:
+        verdict = "full_generation"
+        reason = "检索或路由已变化，旧回答不能继续作为基线"
+    elif signals["score_changed"] or signals["facts_changed"]:
+        verdict = "inspect"
+        reason = "检索稳定但判定变化，先确认是回答变化还是 judge 方差"
+    elif signals["answer_changed"]:
+        verdict = "rejudge_ok"
+        reason = "仅措辞变化，检索与判定稳定，可全量复判"
+    else:
+        verdict = "rejudge_ok"
+        reason = "样本无变化，可全量复判"
+
+    report = {
+        "generated_at": datetime.now().isoformat(timespec="seconds"),
+        "baseline": str(baseline_path),
+        "sample_size": len(sample),
+        "ids": sample,
+        "answer_fingerprint": current_fp,
+        "signals": signals,
+        "verdict": verdict,
+        "reason": reason,
+        "rows": rows,
+    }
+    _write_drift_outputs(report)
+    return report
+
+
+def _write_drift_outputs(report: dict) -> None:
+    REPORT_DIR.mkdir(parents=True, exist_ok=True)
+    (REPORT_DIR / "report_drift.json").write_text(
+        json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    lines = [
+        "# 漂移抽样报告",
+        "",
+        f"- 生成时间：{report['generated_at']}",
+        f"- 基线：{report['baseline']}",
+        f"- 抽样题数：{report['sample_size']}（{', '.join(report['ids'])}）",
+        f"- 当前回答指纹：{report['answer_fingerprint']}",
+        f"- 结论：**{report['verdict']}** — {report['reason']}",
+        f"- 信号：{report['signals']}",
+        "",
+        "| ID | 类别 | 检索变化 | 路由变化 | 回答变化 | 分数 | 事实点变化 |",
+        "|---|---|---|---|---|---|---|",
+    ]
+    for row in report["rows"]:
+        lines.append(
+            f"| {row['id']} | {row['category']} | "
+            f"{'Y' if row['retrieval_changed'] else 'N'} | "
+            f"{'Y' if row['route_changed'] else 'N'} | "
+            f"{'Y' if row['answer_changed'] else 'N'} | "
+            f"{row['score_before']}→{row['score_after']} | "
+            f"{'Y' if row['facts_changed'] else 'N'} |"
+        )
+    (REPORT_DIR / "report_drift.md").write_text(
+        "\n".join(lines) + "\n", encoding="utf-8"
+    )
+    print(json.dumps(report["signals"], ensure_ascii=False, indent=2))
+    print(f"结论：{report['verdict']} — {report['reason']}")
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--limit", type=int, default=None)
@@ -797,14 +1104,44 @@ if __name__ == "__main__":
     parser.add_argument(
         "--ids",
         default="",
-        help="只复判指定题号，逗号分隔（配合 --rejudge）",
+        help="只处理指定题号，逗号分隔（配合 --rejudge / --merge-partial）",
+    )
+    parser.add_argument(
+        "--allow-stale",
+        action="store_true",
+        help="复判时允许使用缺少当前回答指纹的旧结果",
+    )
+    parser.add_argument(
+        "--merge-partial",
+        action="store_true",
+        help="把 --partial 中 --ids 指定的题号显式并入 --results 基线",
+    )
+    parser.add_argument(
+        "--partial",
+        default=str(REPORT_DIR / "results_partial.jsonl"),
+        help="--merge-partial 读取的 partial 结果文件",
+    )
+    parser.add_argument(
+        "--drift-sample",
+        nargs="?",
+        const=12,
+        type=int,
+        default=None,
+        help="分层抽样重生成并比较漂移，默认 12 题",
     )
     args = parser.parse_args()
-    if args.rejudge:
-        ids = {item.strip() for item in args.ids.split(",") if item.strip()} or None
-        rejudge(Path(args.results), args.limit, ids)
+    ids = {item.strip() for item in args.ids.split(",") if item.strip()} or None
+    if args.merge_partial:
+        if not ids:
+            parser.error("--merge-partial 需要 --ids 指定题号")
+        merge_partial(Path(args.partial), Path(args.results), ids)
+    elif args.drift_sample is not None:
+        if args.rejudge:
+            parser.error("--drift-sample 不能与 --rejudge 同时使用")
+        drift_sample(Path(args.results), args.drift_sample)
+    elif args.rejudge:
+        rejudge(Path(args.results), args.limit, ids, allow_stale=args.allow_stale)
     else:
-        ids = {item.strip() for item in args.ids.split(",") if item.strip()} or None
         evaluate(
             limit=args.limit,
             use_judge=not args.no_judge,
