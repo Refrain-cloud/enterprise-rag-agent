@@ -14,6 +14,7 @@ class ParseResult:
     text: str
     error: str = ""
     scanned: bool = False
+    ocr: bool = False
 
 
 class _HTMLText(HTMLParser):
@@ -155,7 +156,7 @@ def _parse_eml(path: Path) -> str:
     return _clean("\n".join(parts))
 
 
-def _parse_pdf(path: Path) -> ParseResult:
+def _parse_pdf(path: Path, doc_id: str = "", use_ocr: bool = True) -> ParseResult:
     from pypdf import PdfReader
 
     reader = PdfReader(str(path))
@@ -164,12 +165,21 @@ def _parse_pdf(path: Path) -> ParseResult:
         text = (page.extract_text() or "").strip()
         if text:
             pages.append(f"## 第 {idx} 页\n{text}")
-    if not pages:
+    if pages:
+        return ParseResult(text=_clean("\n\n".join(pages)))
+
+    if not use_ocr:
         return ParseResult(text="", scanned=True, error="no_text_layer")
-    return ParseResult(text=_clean("\n\n".join(pages)))
+    from src.ingest.ocr import ocr_pdf
+
+    text, errors = ocr_pdf(path, doc_id or path.stem.split("_", 1)[0])
+    if text.strip():
+        return ParseResult(text=_clean(text), ocr=True, error="; ".join(errors))
+    error = "ocr_failed" + (f": {'; '.join(errors)}" if errors else "")
+    return ParseResult(text="", scanned=True, error=error)
 
 
-def parse_file(path: Path) -> ParseResult:
+def parse_file(path: Path, doc_id: str = "", use_ocr: bool = True) -> ParseResult:
     suffix = path.suffix.lower()
     try:
         if suffix == ".docx":
@@ -183,7 +193,7 @@ def parse_file(path: Path) -> ParseResult:
         if suffix == ".eml":
             return ParseResult(text=_parse_eml(path))
         if suffix == ".pdf":
-            return _parse_pdf(path)
+            return _parse_pdf(path, doc_id=doc_id, use_ocr=use_ocr)
         if suffix in (".html", ".htm"):
             return ParseResult(text=_html_to_text(_read_text(path)))
         if suffix in (".md", ".txt", ".json"):

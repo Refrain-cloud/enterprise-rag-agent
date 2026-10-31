@@ -10,12 +10,16 @@ BUILD_DIR = ROOT / "build"
 CORPUS_DIR = BUILD_DIR / "corpus"
 INDEX_DIR = BUILD_DIR / "index"
 CHROMA_DIR = INDEX_DIR / "chroma"
+OCR_DIR = BUILD_DIR / "ocr"
 
 DASHSCOPE_BASE_URL = os.getenv(
     "DASHSCOPE_BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1"
 )
 CHAT_MODEL = os.getenv("RAG_CHAT_MODEL", "qwen-plus")
 EMBED_MODEL = os.getenv("RAG_EMBED_MODEL", "text-embedding-v3")
+OCR_ENABLED = os.getenv("RAG_OCR", "1") not in {"0", "false", "False"}
+OCR_MODEL = os.getenv("RAG_OCR_MODEL", "qwen3-vl-plus")
+GENERATION_SEED = int(os.getenv("RAG_SEED", "42"))
 EMBED_DIM = int(os.getenv("RAG_EMBED_DIM", "1024"))
 EMBED_BATCH = 10
 

@@ -108,6 +108,7 @@ JUDGE_PROMPT = """你是 RAG 评估中的事实提取员，只做核对，不评
    - missing：回答正文没有写；
    - wrong：回答写了，但与标准答案或资料矛盾。
    - 判定以语义为准：允许同义改写、语序调整，也允许同一事实拆到多句或与相邻句合并；只要回答正文表达了该事实的全部要素（主体、数字、日期、结论、条件）即记 covered；只覆盖部分要素才记 missing。
+   - 若一条必答事实点包含多个独立要素（由“且/并/以及/；/同时”连接），须逐要素核对：全部要素都在回答中出现才记 covered，缺少任一要素记 missing。回答把这些要素分散在不同句子时，quote 可用“……”连接多个逐字片段，每个片段都必须能在回答中逐字找到。
    - covered 和 wrong 必须给出 quote：只从最后的“助手回答”中逐字复制支撑片段，不要改写、不要加引号，也不要从检索片段或文件全文中复制。quote 无法在回答中逐字匹配时，按 missing 处理。
    - 如果回答只是复述资料原文、没有针对该事实作出表述，也不能算 covered。
 3. contradictions 只记录回答与检索片段或文件全文直接冲突的陈述；evidence 必须逐字引用冲突原文。找不到直接冲突原文时，contradictions 必须为空。禁止根据制度效力层级、法律解释、“一般条款隐含”等推理判定冲突。
@@ -116,7 +117,7 @@ JUDGE_PROMPT = """你是 RAG 评估中的事实提取员，只做核对，不评
    矛盾必须是两个陈述相互对立。如果回答与 evidence 表达同一结论（例如两者都说某文件已废止），这不是矛盾，不要记录。
    示例：回答称“某制度未重新规定住宿标准”，而该制度全文表格中列有该标准 → 记冲突，evidence 逐字引用该表格行。
    示例：回答称“某文件未对某情形作特别规定”，而全文确实没有该情形的专条 → 不记冲突。
-4. refused：回答是否明确表示无法回答、无权访问或信息不存在，而不是给出实质答案。
+4. refused：回答是否明确表示无法回答、无权访问或信息不存在，而不是给出实质答案。明确说明所问信息不存在、数量为零或公司不具备该属性（如“公司无股票代码”“未设立海外分支机构”），且没有编造具体值，也属于 refused。
 5. 只核对，不要输出分数、理由或建议。
 
 评估对象：
@@ -424,6 +425,33 @@ def _recovery_window(
     return fallback
 
 
+def _compound_parts(claim: str) -> list[str]:
+    """把“A，且B”“A；B”这类复合事实拆成独立子句；括号内的计算/补充说明不参与拆分。"""
+    text = re.sub(r"[（(][^（）()]*[）)]", "", claim)
+    parts = [
+        part.strip(" 。，,；;")
+        for part in re.split(r"[，,；;]\s*(?:且|并且|并|同时|以及)?|(?:并且|同时|以及)", text)
+    ]
+    parts = [part for part in parts if part]
+    if len(parts) < 2 or any(len(part) < 4 for part in parts):
+        return []
+    return parts
+
+
+def _compound_recovery(claim: str, model_answer: str) -> str | None:
+    """逐子句找回：全部子句都在回答中有证据才算覆盖，引文用“……”连接。"""
+    parts = _compound_parts(claim)
+    if not parts:
+        return None
+    quotes = []
+    for part in parts:
+        quote = _recovery_window(part, model_answer, allow_word_fallback=False)
+        if not quote:
+            return None
+        quotes.append(quote)
+    return "……".join(quotes)
+
+
 def _fact_row(
     item: dict,
     fallback_id: str,
@@ -436,12 +464,15 @@ def _fact_row(
     if not claim or status not in {"covered", "missing", "wrong"}:
         return None
     quote = str(item.get("quote", "")).strip()
-    if status in {"covered", "wrong"} and (
-        not _norm(quote)
-        or _norm(quote) not in answer_norm
-        or not _quote_supports_claim(claim, quote, model_answer)
-    ):
-        status, quote = "missing", ""
+    if status in {"covered", "wrong"}:
+        # 复合事实可被回答拆到多句：允许用“……”连接多个逐字片段，每段都须能在回答中逐字找到
+        fragments = [part.strip() for part in re.split(r"…{2,}", quote) if part.strip()]
+        if (
+            not fragments
+            or any(_norm(fragment) not in answer_norm for fragment in fragments)
+            or not _quote_supports_claim(claim, "".join(fragments), model_answer)
+        ):
+            status, quote = "missing", ""
     if status != "covered" and allow_recovery:
         base = re.split(r"[（(]", claim, maxsplit=1)[0].strip()
         if len(_norm(base)) >= 3 and _norm(base) in answer_norm:
@@ -499,6 +530,11 @@ def _build_fact_rows(question: dict, data: dict, model_answer: str) -> list[dict
         }
         row = _fact_row(item, f"K{index}", answer_norm, model_answer, allow_recovery=True)
         if row:
+            if row["status"] == "missing":
+                compound_quote = _compound_recovery(key_fact, model_answer)
+                if compound_quote:
+                    row["status"] = "covered"
+                    row["quote"] = compound_quote
             row["id"] = f"K{index}"
             row["claim"] = key_fact
             rows.append(row)
@@ -550,6 +586,13 @@ def _assemble_judgement(
     )
     if not refused and expect_refusal:
         refused = any(marker in model_answer for marker in ABSENCE_REFUSAL_MARKERS)
+    # 预期拒答题里，字段式“X：无/暂无/不存在”也是明确说明信息不存在，不当作实质回答
+    if (
+        not refused
+        and expect_refusal
+        and re.search(r"[:：]\s*(?:无|暂无|没有|不存在|未设立|未发行)[。；;，,\s]", model_answer)
+    ):
+        refused = True
     statuses = [fact["status"] for fact in facts]
     covered = any(status == "covered" for status in statuses)
     wrong = any(status == "wrong" for status in statuses)

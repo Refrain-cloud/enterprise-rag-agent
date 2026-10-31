@@ -1,9 +1,18 @@
 from __future__ import annotations
 
 import argparse
+import re
 from datetime import date
 
-from src.config import AGG_TOP_K, CHAT_MODEL, TOP_K, ROLES, TABLE_TOOL_ENABLED, get_client
+from src.config import (
+    AGG_TOP_K,
+    CHAT_MODEL,
+    GENERATION_SEED,
+    ROLES,
+    TABLE_TOOL_ENABLED,
+    TOP_K,
+    get_client,
+)
 from src.retrieval.search import hybrid_search
 from src.security.policy import can_access, normalize_role
 from src.tools.sql_tool import answer_with_tables, eligible_table_hits, is_aggregation_question
@@ -11,14 +20,14 @@ from src.tools.sql_tool import answer_with_tables, eligible_table_hits, is_aggre
 SYSTEM_PROMPT = """你是北辰智造科技的内部知识库助手。请严格依据提供的资料回答。
 
 规则：
-1. 只使用资料中的信息，不得编造；资料不足时明确说明无法回答。
+1. 只使用资料中的信息，不得编造；资料不足或资料中没有明确给出的信息时，必须明确说明无法回答，不得用“无”“暂无”等占位值代替答案。
 2. 每个关键事实后用方括号标注文档 ID，例如 [FN-007]；必须使用上下文中的 doc_id，不得用 [资料 N] 或文档标题代替；没有来源的结论不要输出；引用前须核对引文确实出自所标 doc_id 对应的文档，多个群聊、会议纪要或同名文件并存时须按群名、日期或标题对应，不得把 A 文档的原话标成 B 文档。
 3. 同一问题存在多个版本时，优先采用状态为 active 且生效日期最新的正式文件。草稿（draft）、已废止（superseded/outdated）、批注稿不得作为既定事实；草稿只能说明“该文件为草稿、未对外承诺”，不能把草稿中的方案或排期当作已确认计划。资料矛盾时要说明以哪份文件为准及原因；若资料显示旧版本已废止或被替代，须写明旧版本（版本号或年份）及其废止依据，不能只给现行结论；资料标题行、修订说明或附则中出现“替代/废止/取代”声明时，即使问题只问现行数值，也须逐一列出被替代的每个旧版本（版本号或年份）、其对应数值或结论及失效依据，不能只列其中一个；若同一事实存在旧版与现行值，须在同一句中以“旧版为 X，现行为 Y”的形式对照说明，旧版本须写明版本号或年份。
 4. 表格数据可以计算，但要说明统计口径（例如仅统计“已付款”）；逐行核对，确保笔数与金额一致，不要凭印象计数。
 5. 如果资料显示某个信息属于机密且当前角色无权查看，直接说明无权访问，不得透露内容。
 6. 今天的日期是 {today}。判断文件是否已生效、是否为现行版本时，一律以该日期为准，不要假设当前年份。
 7. 对“能否/可不可以/能不能/是否允许”类问题，除给出允许或禁止的结论外，必须写出资料中的例外条件或合规替代做法（例如“改用公司内部部署的模型或先脱敏”）；资料没有时不要臆造。
-8. 引用表格或结构化字段时，保留字段名与取值的对应关系（如“目标职级：P4”“薪资：18K 以内”），不要把不同字段合并改写。当回答需要给出结构化字段（如姓名、职级、薪资、结论、日期等）时，必须以“字段名：取值”列表逐行输出，字段名须与资料表格中的字段名完全一致；表格中与被问内容相关的字段一个都不能漏；表格与正文简写不一致时以表格为准，不得沿用“建议”句里的简写，不得把多个字段合并成一句。
+8. 引用表格或结构化字段时，保留字段名与取值的对应关系（如“目标职级：P4”“薪资：18K 以内”），不要把不同字段合并改写。当回答需要给出结构化字段（如姓名、职级、薪资、结论、日期等）时，必须逐行输出“字段名：取值”，冒号前直接写资料表格中的字段名（如“目标职级：P4”），不要写“字段名”“取值”这类字面标签；字段名须与资料表格完全一致；表格中同一对象、同一行的字段是一个整体，必须完整逐行列出（对象、日期、职级、结论、数值等），不能只列问题字面问到的字段；表格与正文简写不一致时以表格为准，不得沿用“建议”句里的简写，不得把多个字段合并成一句。
 9. 区分“客户确认/正式承诺”与“内部计划”：会议纪要、拜访记录、销售预测中的日期、方案或目标，若未标明客户确认或未形成正式合同，只能表述为内部计划/建议，并写出前提条件；不得写成已确定的重启时间或交付承诺。
 10. 回答使用专业中文；须完整覆盖资料中与问题相关的功能、条件、限制和版本状态，完整性优先于简洁。"""
 
@@ -39,15 +48,38 @@ def _status_label(status: str) -> str:
 
 def _format_context(hits: list[dict]) -> str:
     blocks = []
-    for index, hit in enumerate(hits, 1):
+    for hit in hits:
         meta = hit["metadata"]
         blocks.append(
-            f"[资料 {index}] doc_id={meta['doc_id']} | 标题={meta['title']} | "
+            f"[{meta['doc_id']}] 标题={meta['title']} | "
             f"版本={meta['version']} | 状态={_status_label(meta['status'])} | "
             f"生效日期={meta['effective_date']} | 密级={meta['classification']} | "
             f"路径={meta['path']}\n{hit['text']}"
         )
     return "\n\n".join(blocks)
+
+
+CITE_PATTERN = re.compile(r"\[([A-Z]{2,}-\d+[A-Z]?)\]")
+
+
+def _ensure_draft_disclosure(text: str, hits: list[dict]) -> str:
+    """回答引用了草稿却没说明状态时，按元数据补一条声明，避免把草稿内容当作已确认计划。"""
+    meta_by_id: dict[str, dict] = {}
+    for hit in hits:
+        meta = hit["metadata"]
+        meta_by_id.setdefault(meta["doc_id"], meta)
+    drafts = [
+        (doc_id, meta_by_id[doc_id])
+        for doc_id in sorted(set(CITE_PATTERN.findall(text)) & set(meta_by_id))
+        if meta_by_id[doc_id].get("status") == "draft"
+    ]
+    if not drafts or "草稿" in text or "draft" in text.lower() or "未对外承诺" in text:
+        return text
+    notes = "；".join(
+        f"[{doc_id}]《{meta.get('title', '')}》为草稿版本，未对外承诺"
+        for doc_id, meta in drafts
+    )
+    return f"{text.rstrip()}\n\n注：{notes}，其中的排期与方案仅用于内部讨论。"
 
 
 def _sources(hits: list[dict]) -> list[dict]:
@@ -129,9 +161,12 @@ def answer(question: str, role: str = "普通员工", top_k: int = TOP_K) -> dic
         messages=messages,
         temperature=0,
         max_tokens=900,
+        seed=GENERATION_SEED,
     )
     return {
-        "answer": response.choices[0].message.content.strip(),
+        "answer": _ensure_draft_disclosure(
+            response.choices[0].message.content.strip(), hits
+        ),
         "sources": _sources(hits),
         "hits": hits,
         "denied": False,
