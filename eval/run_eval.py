@@ -514,9 +514,17 @@ def _assemble_judgement(
     if leaked:
         parts.append("检测到权限泄漏")
 
+    faithful = (not wrong) and (not contradictions)
+    has_key_facts = any(str(f).strip() for f in (question.get("key_facts") or []))
+    # 未指定必答点的预期拒答题正确拒答时，标准答案本身就是“无法回答”；
+    # 回答写成“未提及…数量为 0 家”等更具体表述，不再因自动拆分的事实点被判 wrong 而算不忠实。
+    # 真实矛盾仍由 contradictions 检出，且带必答点的拒答题不适用此兜底。
+    if expect_refusal and refused and not has_key_facts and not contradictions:
+        faithful = True
+
     return {
         "score": score,
-        "faithful": (not wrong) and (not contradictions),
+        "faithful": faithful,
         "refusal_ok": refused == expect_refusal,
         "permission_ok": not leaked,
         "reason": "；".join(parts),
@@ -747,12 +755,35 @@ def rejudge(
     return report
 
 
+def _gold_coverage(result: dict) -> tuple[int, int]:
+    """返回（命中的 gold 文档数，gold 文档总数）；无 gold 时返回 (0, 0)。"""
+    gold = set(result.get("gold_doc_ids") or [])
+    if not gold:
+        return 0, 0
+    return len(set(result.get("retrieved_ids") or []) & gold), len(gold)
+
+
+def _coverage_metrics(results: list[dict]) -> dict:
+    pairs = [_gold_coverage(result) for result in results]
+    pairs = [(hit, total) for hit, total in pairs if total]
+    gold_total = sum(total for _, total in pairs)
+    hit_total = sum(hit for hit, _ in pairs)
+    return {
+        # micro：全部 gold 文档中被召回的比例，多跳题的部分缺口不会被“任一命中”掩盖
+        "gold_doc_coverage": hit_total / gold_total if gold_total else None,
+        "gold_doc_full_rate": (
+            sum(1 for hit, total in pairs if hit == total) / len(pairs) if pairs else None
+        ),
+    }
+
+
 def _aggregate(results: list[dict], source: str) -> dict:
     gold_results = [r for r in results if r["gold_doc_ids"]]
     retrieval_recall = (
         sum(1 for r in gold_results if r["retrieval_hit"]) / len(gold_results)
         if gold_results else 0.0
     )
+    coverage = _coverage_metrics(results)
     mrr = (
         sum(r["reciprocal_rank"] for r in gold_results) / len(gold_results)
         if gold_results else 0.0
@@ -797,6 +828,7 @@ def _aggregate(results: list[dict], source: str) -> dict:
                 sum(1 for item in items_with_gold if item["retrieval_hit"]) / len(items_with_gold)
                 if items_with_gold else None
             ),
+            **_coverage_metrics(items),
             "avg_score": sum(scores) / len(scores) if scores else None,
             "routes": dict(sorted(Counter(item["route"] for item in items).items())),
         }
@@ -832,6 +864,7 @@ def _aggregate(results: list[dict], source: str) -> dict:
         },
         "metrics": {
             "retrieval_recall": retrieval_recall,
+            **coverage,
             "mrr": mrr,
             "citation_rate": citation_rate,
             "avg_answer_score": avg_score,
@@ -861,6 +894,10 @@ def _write_outputs(report: dict, directory: Path, stem: str, results_name: str) 
     print(json.dumps(report["metrics"], ensure_ascii=False, indent=2))
 
 
+def _fmt_float(value: float | None) -> str:
+    return f"{value:.3f}" if value is not None else "-"
+
+
 def _write_markdown(report: dict, path: Path) -> None:
     metrics = report["metrics"]
     fingerprints = report.get("fingerprints") or {}
@@ -870,6 +907,8 @@ def _write_markdown(report: dict, path: Path) -> None:
         f"- 生成时间：{report['generated_at']}",
         f"- 题目数：{report['question_count']}",
         f"- 检索 Recall：{metrics['retrieval_recall']:.3f}",
+        f"- Gold 文档覆盖率（micro）：{_fmt_float(metrics.get('gold_doc_coverage'))}",
+        f"- Gold 文档全命中率：{_fmt_float(metrics.get('gold_doc_full_rate'))}",
         f"- MRR：{metrics['mrr']:.3f}",
         f"- 引用命中率：{metrics['citation_rate']:.3f}",
         f"- 平均答案得分：{metrics['avg_answer_score']}",
@@ -891,16 +930,18 @@ def _write_markdown(report: dict, path: Path) -> None:
         "",
         "## 分类指标",
         "",
-        "| 类别 | 题数 | 检索 Recall | 平均分 | 路由 |",
-        "|---|---|---|---|---|",
+        "| 类别 | 题数 | 检索 Recall | Gold 覆盖率 | 平均分 | 路由 |",
+        "|---|---|---|---|---|---|",
     ]
     for category, metric in report["by_category"].items():
         recall = metric["retrieval_recall"]
         avg = metric["avg_score"]
         recall_text = f"{recall:.3f}" if recall is not None else "-"
+        coverage_text = _fmt_float(metric.get("gold_doc_coverage"))
         avg_text = f"{avg:.2f}" if avg is not None else "-"
         lines.append(
-            f"| {category} | {metric['count']} | {recall_text} | {avg_text} | {metric['routes']} |"
+            f"| {category} | {metric['count']} | {recall_text} | {coverage_text} | "
+            f"{avg_text} | {metric['routes']} |"
         )
     lines.extend([
         "",
