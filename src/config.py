@@ -21,10 +21,10 @@ EMBED_BATCH = 10
 
 CHUNK_SIZE = int(os.getenv("RAG_CHUNK_SIZE", "700"))
 CHUNK_OVERLAP = int(os.getenv("RAG_CHUNK_OVERLAP", "120"))
-TOP_K = int(os.getenv("RAG_TOP_K", "8"))
+TOP_K = int(os.getenv("RAG_TOP_K", "12"))
 CANDIDATE_K = int(os.getenv("RAG_CANDIDATE_K", "40"))
 # 聚合题需要更宽的候选集，避免表格文档被叙述型文档挤出 top-K
-AGG_TOP_K = int(os.getenv("RAG_AGG_TOP_K", "10"))
+AGG_TOP_K = int(os.getenv("RAG_AGG_TOP_K", "16"))
 
 ROLES = ("普通员工", "HR", "财务", "销售", "IT", "产品", "管理层")
 

@@ -48,7 +48,10 @@ RESTATE_SYSTEM_PROMPT = """你负责把数据库查询结果转述成中文回�
 5. 简洁专业，不要提及 SQL、数据库、查询语句或 “t_” 开头的内部表名。"""
 
 
-VERSION_MARKERS = ("以哪份文件为准", "现行版本", "哪一版", "最新版", "是否废止", "已经废止")
+VERSION_MARKERS = (
+    "以哪份文件为准", "现行版本", "哪一版", "最新版", "是否废止", "已经废止",
+    "原来的", "还在吗", "是否还在",
+)
 
 
 def is_aggregation_question(question: str) -> bool:
