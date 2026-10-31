@@ -222,6 +222,11 @@ def _canon(text: str) -> str:
         ("不可", "不能"),
         ("不予", "不能"),
         ("没有", "无"),
+        ("失效", "废止"),
+        ("作废", "废止"),
+        ("过时", "废止"),
+        ("当前", "现行"),
+        ("目前", "现行"),
     ):
         normalized = normalized.replace(variant, canonical)
     # 统一配置/单位的常见写法：8C ≡ 8 核，32G ≡ 32GB，2T ≡ 2TB；草稿中英混用
@@ -301,22 +306,94 @@ def _number_in(number: str, sentence_norm: str) -> bool:
     return len(parts) > 1 and all(_norm(part) in sentence_norm for part in parts)
 
 
-def _recovery_window(claim: str, model_answer: str) -> str | None:
+_IDENTIFIER_TOKEN = re.compile(
+    r"[A-Za-z]+[-/]?\d+(?:\.\d+)*[A-Za-z]?|[A-Za-z]+\d+(?:\.\d+)*"
+)
+
+
+def _claim_numbers(text: str) -> list[str]:
+    """只取独立数量：V1.0、V3.2.2、HR-002、S1 等标识符里的数字不算事实数量。"""
+    return re.findall(r"\d+(?:[.,]\d+)?", _IDENTIFIER_TOKEN.sub(" ", text))
+
+
+_WORD_STOPWORDS = frozenset("的了和与及为在约而就等都或对将把被于该本属已其中")
+_NEGATION = re.compile(r"(不|未|无|没有|非|禁止|拒绝|否定)")
+
+
+@lru_cache(maxsize=8192)
+def _content_words(text: str) -> tuple[str, ...]:
+    import jieba
+
+    jieba.setLogLevel(20)
+    normalized = _canon(text).replace("万元", "万")
+    return tuple(
+        word
+        for word in jieba.cut_for_search(normalized)
+        if len(word) >= 2 and word not in _WORD_STOPWORDS and not word.isdigit()
+    )
+
+
+def _word_level_recovery(claim: str, model_answer: str) -> str | None:
+    """实词覆盖兜底：吸收“转入/并入”“投入约11人月/累计投入11个人月”这类改写。
+
+    含否定词的事实不走这条路径，避免“不愿承担/愿意承担”因实词重合被判覆盖。
+    """
+    if _NEGATION.search(claim):
+        return None
+    claim_words = _content_words(claim)
+    if len(claim_words) < 3:
+        return None
+    answer_norm = _canon(model_answer)
+    numbers = _claim_numbers(claim)
+    if any(not _number_in(number, answer_norm) for number in numbers):
+        return None
+    answer_words = set(_content_words(model_answer))
+    hits = sum(1 for word in claim_words if word in answer_words)
+    if hits * 10 < len(claim_words) * 8:
+        return None
+    sentences = [part.strip(" -*") for part in re.split(r"[。；;\n]", model_answer) if part.strip()]
+    if not sentences:
+        return model_answer.strip()
+    candidates = sentences
+    if numbers:
+        windows = sentences + [
+            f"{sentences[i]} {sentences[i + 1]}" for i in range(len(sentences) - 1)
+        ]
+        candidates = [
+            window
+            for window in windows
+            if all(_number_in(number, _canon(window)) for number in numbers)
+        ] or sentences
+    return max(
+        candidates,
+        key=lambda sentence: sum(
+            1 for word in claim_words if word in set(_content_words(sentence))
+        ),
+    ).strip()
+
+
+def _recovery_window(
+    claim: str, model_answer: str, allow_word_fallback: bool = True
+) -> str | None:
     """事实点被同义改写或拆到相邻句时，按“数字全部命中 + 二字词覆盖率”找回。"""
-    numbers = re.findall(r"\d+(?:[.,]\d+)?", claim)
+    fallback = (
+        _word_level_recovery(claim, model_answer) if allow_word_fallback else None
+    )
+    numbers = _claim_numbers(claim)
     claim_norm = _canon(claim)
     bigrams = [claim_norm[i : i + 2] for i in range(len(claim_norm) - 1)]
     if not bigrams:
         return None
     sentences = [part.strip(" -*") for part in re.split(r"[。；;\n]", model_answer) if part.strip()]
     if not numbers:
-        # 无数字事实常被拆到多句，按整篇回答算覆盖率；0.70 可区分“改写到不同句”和“漏掉关键限定词”
+        # 无数字事实常被拆到多句，按整篇回答算覆盖率；60% 可吸收“须待/需视”等同义改写，
+        # 同时仍要求主体词（如客户、预算）多数命中，避免只沾一个词就判覆盖。
         if len(claim_norm) < 4:
-            return None
+            return fallback
         whole = _canon(model_answer)
-        need = min(len(bigrams), max(2, -(-len(bigrams) * 65 // 100)))
+        need = min(len(bigrams), max(2, -(-len(bigrams) * 60 // 100)))
         if sum(1 for bigram in bigrams if bigram in whole) < need:
-            return None
+            return fallback
         if not sentences:
             return model_answer.strip()
         return max(
@@ -344,7 +421,7 @@ def _recovery_window(claim: str, model_answer: str) -> str | None:
                 sentences,
                 key=lambda sentence: sum(1 for bigram in bigrams if bigram in _canon(sentence)),
             ).strip()
-    return None
+    return fallback
 
 
 def _fact_row(
@@ -370,7 +447,9 @@ def _fact_row(
         if len(_norm(base)) >= 3 and _norm(base) in answer_norm:
             claim, quote, status = base, base, "covered"
         else:
-            recovered = _recovery_window(claim, model_answer)
+            recovered = _recovery_window(
+                claim, model_answer, allow_word_fallback=(status == "missing")
+            )
             if recovered:
                 quote, status = recovered, "covered"
     return {"id": str(item.get("id") or fallback_id), "claim": claim, "status": status, "quote": quote}
@@ -535,6 +614,50 @@ def _assemble_judgement(
     }
 
 
+def _escape_inner_quotes(raw: str) -> str:
+    """模型把原文引号直接塞进 JSON 字符串时，把非结构性的 " 转义掉。"""
+    out: list[str] = []
+    in_str = False
+    escaped = False
+    for index, char in enumerate(raw):
+        if not in_str:
+            out.append(char)
+            if char == '"':
+                in_str = True
+            continue
+        if escaped:
+            out.append(char)
+            escaped = False
+            continue
+        if char == "\\":
+            out.append(char)
+            escaped = True
+            continue
+        if char != '"':
+            out.append(char)
+            continue
+        probe = index + 1
+        while probe < len(raw) and raw[probe] in " \t\r\n":
+            probe += 1
+        if probe >= len(raw) or raw[probe] in ":}],":
+            out.append(char)
+            in_str = False
+        else:
+            out.append('\\"')
+    return "".join(out)
+
+
+def _parse_judge_json(text: str) -> dict:
+    match = re.search(r"\{.*\}", text, re.S)
+    if not match:
+        raise ValueError(f"judge returned non-JSON: {text[:200]}")
+    raw = match.group(0)
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        return json.loads(_escape_inner_quotes(raw))
+
+
 def judge(
     question: dict,
     model_answer: str,
@@ -565,13 +688,10 @@ def judge(
                 max_tokens=1200,
             )
             text = response.choices[0].message.content.strip()
-            match = re.search(r"\{.*\}", text, re.S)
-            if match:
-                data = json.loads(match.group(0))
-                return _assemble_judgement(
-                    question, data, context or "", full_docs or "", leaked, model_answer
-                )
-            raise ValueError(f"judge returned non-JSON: {text[:200]}")
+            data = _parse_judge_json(text)
+            return _assemble_judgement(
+                question, data, context or "", full_docs or "", leaked, model_answer
+            )
         except Exception as exc:
             last_error = exc
             time.sleep(2**attempt)
@@ -692,12 +812,12 @@ def evaluate(
     return report
 
 
-def rejudge(
+def _rows_for_judging(
     results_path: Path,
     limit: int | None,
-    ids: set[str] | None = None,
-    allow_stale: bool = False,
-) -> dict:
+    ids: set[str] | None,
+    allow_stale: bool,
+) -> list[dict]:
     rows = [json.loads(line) for line in results_path.open(encoding="utf-8")]
     if ids:
         rows = [row for row in rows if row["id"] in ids]
@@ -721,38 +841,303 @@ def rejudge(
                 "已存回答已过期或缺少指纹：先全量重生成；"
                 "确认只验证 judge 时再加 --allow-stale。"
             )
+    return rows
+
+
+def _hits_for_row(row: dict) -> list[dict]:
+    if not row["retrieved_ids"]:
+        return []
+    # 聚合题答案生成时可能放宽了候选集，复判时按实际检索条数还原上下文
+    top_k = max(len(row["retrieved_ids"]), TOP_K)
+    hits = hybrid_search(row["question"], role=row["role"], top_k=top_k)
+    got = [hit["metadata"]["doc_id"] for hit in hits]
+    if got != row["retrieved_ids"]:
+        print(f"  WARN: retrieved ids differ\n    now={got}\n    old={row['retrieved_ids']}")
+    return hits
+
+
+def _fact_signature(judged: dict) -> tuple[tuple[str, str], ...]:
+    return tuple(
+        (str(fact.get("id", "")), str(fact.get("status", "")))
+        for fact in judged.get("facts") or []
+    )
+
+
+def _modal_judgement(runs: list[dict]) -> dict:
+    """重复判分时取众数：先按分数，再按事实点状态组合，避免单次抖动定分。"""
+    valid = [run for run in runs if run.get("score") is not None]
+    if not valid:
+        return runs[0]
+    score = Counter(run["score"] for run in valid).most_common(1)[0][0]
+    candidates = [run for run in valid if run["score"] == score]
+    signature = Counter(_fact_signature(run) for run in candidates).most_common(1)[0][0]
+    return next(run for run in candidates if _fact_signature(run) == signature)
+
+
+def rejudge(
+    results_path: Path,
+    limit: int | None,
+    ids: set[str] | None = None,
+    allow_stale: bool = False,
+    judge_repeats: int = 1,
+) -> dict:
+    rows = _rows_for_judging(results_path, limit, ids, allow_stale)
+    judge_repeats = max(1, judge_repeats)
 
     results: list[dict] = []
     for index, row in enumerate(rows, 1):
         print(f"[{index}/{len(rows)}] rejudge {row['id']}")
-        if row["retrieved_ids"]:
-            # 聚合题答案生成时可能放宽了候选集，复判时按实际检索条数还原上下文
-            top_k = max(len(row["retrieved_ids"]), TOP_K)
-            hits = hybrid_search(row["question"], role=row["role"], top_k=top_k)
-            got = [hit["metadata"]["doc_id"] for hit in hits]
-            if got != row["retrieved_ids"]:
-                print(f"  WARN: retrieved ids differ\n    now={got}\n    old={row['retrieved_ids']}")
-        else:
-            hits = []
-        judged = judge(
-            row,
-            row["model_answer"],
-            context=_judge_excerpt(hits),
-            full_docs=_full_docs_context(row["model_answer"], row["gold_doc_ids"]),
-            leaked=bool(row.get("leaked_ids") or row.get("leaked_terms")),
-        )
-        results.append(
-            {**row, "judge": judged, "judge_fingerprint": _judge_fingerprint(row)}
-        )
+        hits = _hits_for_row(row)
+        context = _judge_excerpt(hits)
+        full_docs = _full_docs_context(row["model_answer"], row["gold_doc_ids"])
+        leaked = bool(row.get("leaked_ids") or row.get("leaked_terms"))
+        runs = [
+            judge(row, row["model_answer"], context=context, full_docs=full_docs, leaked=leaked)
+            for _ in range(judge_repeats)
+        ]
+        judged = _modal_judgement(runs) if len(runs) > 1 else runs[0]
+        record = {**row, "judge": judged, "judge_fingerprint": _judge_fingerprint(row)}
+        if len(runs) > 1:
+            record["judge_repeat_scores"] = [run["score"] for run in runs]
+        results.append(record)
+        scores = [run["score"] for run in runs]
+        suffix = f" repeats={scores}" if len(runs) > 1 else ""
         print(
             f"  score={judged['score']} faithful={judged['faithful']} "
-            f"unsupported={len(judged['unsupported_claims'])}"
+            f"unsupported={len(judged['unsupported_claims'])}{suffix}"
         )
 
     report = _aggregate(results, str(results_path))
     report["rejudged_from"] = str(results_path)
+    if judge_repeats > 1:
+        report["judge_repeats"] = judge_repeats
+        report["judge_score_agreement"] = (
+            sum(
+                1 for row in results
+                if len(set(row.get("judge_repeat_scores", []))) == 1
+            ) / len(results)
+            if results else None
+        )
     _write_outputs(report, REPORT_DIR, "report_rejudge", "results_rejudge.jsonl")
     return report
+
+
+def _run_metrics(judged_rows: list[dict]) -> dict:
+    judged = [row for row in judged_rows if row["score"] is not None]
+    return {
+        "avg_answer_score": (
+            sum(row["score"] for row in judged) / len(judged) if judged else None
+        ),
+        "faithful_rate": (
+            sum(1 for row in judged if row["faithful"]) / len(judged)
+            if judged else None
+        ),
+        "refusal_accuracy": (
+            sum(1 for row in judged if row["refusal_ok"]) / len(judged)
+            if judged else None
+        ),
+        "score_distribution": dict(sorted(Counter(row["score"] for row in judged).items())),
+    }
+
+
+def judge_stability(
+    results_path: Path,
+    repeats: int = 3,
+    ids: set[str] | None = None,
+    limit: int | None = None,
+    allow_stale: bool = False,
+) -> dict:
+    """对同一批已存回答重复判分，量化 judge 的逐题一致性。"""
+    if repeats < 2:
+        raise SystemExit("--judge-stability 至少需要 2 次重复判分")
+    rows = _rows_for_judging(results_path, limit, ids, allow_stale)
+
+    records: list[dict] = []
+    for index, row in enumerate(rows, 1):
+        hits = _hits_for_row(row)
+        context = _judge_excerpt(hits)
+        full_docs = _full_docs_context(row["model_answer"], row["gold_doc_ids"])
+        leaked = bool(row.get("leaked_ids") or row.get("leaked_terms"))
+        runs = [
+            judge(row, row["model_answer"], context=context, full_docs=full_docs, leaked=leaked)
+            for _ in range(repeats)
+        ]
+        scores = [run["score"] for run in runs]
+        faithfuls = [run["faithful"] for run in runs]
+        refusals = [run["refusal_ok"] for run in runs]
+        fact_signatures = {_fact_signature(run) for run in runs}
+        majority = Counter(scores).most_common(1)[0][0]
+        record = {
+            "id": row["id"],
+            "category": row["category"],
+            "stored_score": (row.get("judge") or {}).get("score"),
+            "repeat_scores": scores,
+            "majority_score": majority,
+            "score_stable": len(set(scores)) == 1,
+            "facts_stable": len(fact_signatures) == 1,
+            "faithful_stable": len(set(faithfuls)) == 1,
+            "refusal_stable": len(set(refusals)) == 1,
+            "repeat_reasons": [run["reason"] for run in runs],
+            "runs": runs,
+        }
+        records.append(record)
+        print(
+            f"[{index}/{len(rows)}] {row['id']} stored={record['stored_score']} "
+            f"repeats={scores} facts_stable={record['facts_stable']}",
+            flush=True,
+        )
+
+    def _rate(key: str) -> float | None:
+        return sum(1 for record in records if record[key]) / len(records) if records else None
+
+    run_metrics = [
+        _run_metrics([record["runs"][run_index] for record in records])
+        for run_index in range(repeats)
+    ]
+    majority_metrics = _run_metrics(
+        [
+            {**record["runs"][0], "score": record["majority_score"]}
+            for record in records
+        ]
+    )
+    unstable = [
+        record for record in records
+        if not (
+            record["score_stable"]
+            and record["facts_stable"]
+            and record["faithful_stable"]
+            and record["refusal_stable"]
+        )
+    ]
+    changed = [
+        record for record in records
+        if record["stored_score"] != record["majority_score"]
+    ]
+    report = {
+        "generated_at": datetime.now().isoformat(timespec="seconds"),
+        "results_file": str(results_path),
+        "question_count": len(records),
+        "repeats": repeats,
+        "agreement": {
+            "score": _rate("score_stable"),
+            "facts": _rate("facts_stable"),
+            "faithful": _rate("faithful_stable"),
+            "refusal": _rate("refusal_stable"),
+            "all": (
+                sum(
+                    1 for record in records
+                    if record["score_stable"]
+                    and record["facts_stable"]
+                    and record["faithful_stable"]
+                    and record["refusal_stable"]
+                ) / len(records)
+                if records else None
+            ),
+        },
+        "run_metrics": run_metrics,
+        "majority_metrics": majority_metrics,
+        "stored_metrics": _run_metrics(
+            [row.get("judge") or {"score": None} for row in rows]
+        ),
+        "unstable": [
+            {
+                key: record[key]
+                for key in (
+                    "id", "category", "stored_score", "repeat_scores",
+                    "score_stable", "facts_stable", "faithful_stable", "refusal_stable",
+                )
+            }
+            for record in unstable
+        ],
+        "changed_vs_stored": [
+            {
+                "id": record["id"],
+                "stored": record["stored_score"],
+                "majority": record["majority_score"],
+                "repeats": record["repeat_scores"],
+            }
+            for record in changed
+        ],
+        "records": records,
+    }
+    _write_stability_outputs(report)
+    return report
+
+
+def _fmt_rate(value: float | None) -> str:
+    return f"{value:.3f}" if value is not None else "-"
+
+
+def _write_stability_outputs(report: dict) -> None:
+    REPORT_DIR.mkdir(parents=True, exist_ok=True)
+    (REPORT_DIR / "report_stability.json").write_text(
+        json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    agreement = report["agreement"]
+    lines = [
+        "# Judge 稳定性报告",
+        "",
+        f"- 生成时间：{report['generated_at']}",
+        f"- 结果文件：{report['results_file']}",
+        f"- 题数：{report['question_count']}，每题重复判分：{report['repeats']} 次",
+        f"- 分数完全一致：{_fmt_rate(agreement['score'])}",
+        f"- 事实点状态完全一致：{_fmt_rate(agreement['facts'])}",
+        f"- 忠实判定完全一致：{_fmt_rate(agreement['faithful'])}",
+        f"- 拒答判定完全一致：{_fmt_rate(agreement['refusal'])}",
+        f"- 四项全部一致：{_fmt_rate(agreement['all'])}",
+        "",
+        "## 各轮聚合指标",
+        "",
+        "| 轮次 | 平均分 | 忠实率 | 拒答正确率 | 得分分布 |",
+        "|---|---|---|---|---|",
+    ]
+    for index, metrics in enumerate(report["run_metrics"], 1):
+        lines.append(
+            f"| 第 {index} 轮 | {_fmt_float(metrics['avg_answer_score'])} | "
+            f"{_fmt_float(metrics['faithful_rate'])} | "
+            f"{_fmt_float(metrics['refusal_accuracy'])} | "
+            f"{metrics['score_distribution']} |"
+        )
+    majority = report["majority_metrics"]
+    lines.append(
+        f"| 多数票 | {_fmt_float(majority['avg_answer_score'])} | "
+        f"{_fmt_float(majority['faithful_rate'])} | "
+        f"{_fmt_float(majority['refusal_accuracy'])} | "
+        f"{majority['score_distribution']} |"
+    )
+    stored = report["stored_metrics"]
+    lines.append(
+        f"| 已存判定 | {_fmt_float(stored['avg_answer_score'])} | "
+        f"{_fmt_float(stored['faithful_rate'])} | "
+        f"{_fmt_float(stored['refusal_accuracy'])} | "
+        f"{stored['score_distribution']} |"
+    )
+    lines.extend([
+        "",
+        "## 不一致题目",
+        "",
+        "| ID | 类别 | 已存分 | 重复分 | 分数稳定 | 事实点稳定 | 忠实稳定 | 拒答稳定 |",
+        "|---|---|---|---|---|---|---|---|",
+    ])
+    for record in report["unstable"]:
+        lines.append(
+            f"| {record['id']} | {record['category']} | {record['stored_score']} | "
+            f"{record['repeat_scores']} | "
+            f"{'Y' if record['score_stable'] else 'N'} | "
+            f"{'Y' if record['facts_stable'] else 'N'} | "
+            f"{'Y' if record['faithful_stable'] else 'N'} | "
+            f"{'Y' if record['refusal_stable'] else 'N'} |"
+        )
+    if not report["unstable"]:
+        lines.append("| - | - | - | - | - | - | - | - |")
+    (REPORT_DIR / "report_stability.md").write_text(
+        "\n".join(lines) + "\n", encoding="utf-8"
+    )
+    print(json.dumps(
+        {key: report[key] for key in ("repeats", "agreement", "majority_metrics")},
+        ensure_ascii=False,
+        indent=2,
+    ))
 
 
 def _gold_coverage(result: dict) -> tuple[int, int]:
@@ -1178,6 +1563,12 @@ if __name__ == "__main__":
         help="复判时允许使用缺少当前回答指纹的旧结果",
     )
     parser.add_argument(
+        "--judge-repeats",
+        type=int,
+        default=1,
+        help="每题重复判分次数，取众数写入基线（建议 3；默认 1）",
+    )
+    parser.add_argument(
         "--merge-partial",
         action="store_true",
         help="把 --partial 中 --ids 指定的题号显式并入 --results 基线",
@@ -1186,6 +1577,14 @@ if __name__ == "__main__":
         "--partial",
         default=str(REPORT_DIR / "results_partial.jsonl"),
         help="--merge-partial 读取的 partial 结果文件",
+    )
+    parser.add_argument(
+        "--judge-stability",
+        nargs="?",
+        const=3,
+        type=int,
+        default=None,
+        help="复用已存回答重复判分 N 次，量化 judge 稳定性（默认 3）",
     )
     parser.add_argument(
         "--drift-sample",
@@ -1205,8 +1604,22 @@ if __name__ == "__main__":
         if args.rejudge:
             parser.error("--drift-sample 不能与 --rejudge 同时使用")
         drift_sample(Path(args.results), args.drift_sample)
+    elif args.judge_stability:
+        judge_stability(
+            Path(args.results),
+            args.judge_stability,
+            ids,
+            args.limit,
+            allow_stale=args.allow_stale,
+        )
     elif args.rejudge:
-        rejudge(Path(args.results), args.limit, ids, allow_stale=args.allow_stale)
+        rejudge(
+            Path(args.results),
+            args.limit,
+            ids,
+            allow_stale=args.allow_stale,
+            judge_repeats=args.judge_repeats,
+        )
     else:
         evaluate(
             limit=args.limit,
