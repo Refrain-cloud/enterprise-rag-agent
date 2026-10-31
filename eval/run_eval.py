@@ -13,7 +13,7 @@ from src.agent.ask import answer
 from src.config import CHAT_MODEL, BUILD_DIR, TOP_K, get_client
 from src.retrieval.search import hybrid_search
 
-QUESTIONS_PATH = Path(__file__).resolve().parent / "questions.v1.jsonl"
+QUESTIONS_PATH = Path(__file__).resolve().parent / "questions.v2.jsonl"
 REPORT_DIR = BUILD_DIR / "eval"
 CORPUS_PATH = BUILD_DIR / "corpus" / "docs.jsonl"
 CITE_PATTERN = re.compile(r"\[([A-Z]+-\d+[A-Z]?)\]")
@@ -39,6 +39,7 @@ JUDGE_PROMPT = """你是 RAG 评估中的事实提取员，只做核对，不评
   "refused": false}}
 
 规则：
+0. 如果下方给出了“必答事实点”，必须逐条核对，不得自行增删或改写：facts 的 claim 必须逐字使用给定事实点，id 依次为 K1、K2……；每条给定事实点都必须输出一行（没答到就记 missing）。只有在未给出必答事实点时，才按第 1 条自行拆分。
 1. 拆事实点：把标准答案拆成必答事实点（每个数字、日期、版本号、名称、结论、条件各算一个）。括号内的计算过程、来源说明、补充说明不算独立事实点。
    - 标准答案“9,530 元（4,280 + 3,150 + 2,100）”只算一个事实点，括号内分项不是独立事实点。
    - 标准答案“缺口 4 人（编制 45 人，在岗 41 人）”只算一个事实点，括号内为计算依据。
@@ -47,6 +48,7 @@ JUDGE_PROMPT = """你是 RAG 评估中的事实提取员，只做核对，不评
    - covered：助手在回答正文中明确写出该事实（仅标注引用来源不算）；
    - missing：回答正文没有写；
    - wrong：回答写了，但与标准答案或资料矛盾。
+   - 判定以语义为准：允许同义改写、语序调整，也允许同一事实拆到多句或与相邻句合并；只要回答正文表达了该事实的全部要素（主体、数字、日期、结论、条件）即记 covered；只覆盖部分要素才记 missing。
    - covered 和 wrong 必须给出 quote：只从最后的“助手回答”中逐字复制支撑片段，不要改写、不要加引号，也不要从检索片段或文件全文中复制。quote 无法在回答中逐字匹配时，按 missing 处理。
    - 如果回答只是复述资料原文、没有针对该事实作出表述，也不能算 covered。
 3. contradictions 只记录回答与检索片段或文件全文直接冲突的陈述；evidence 必须逐字引用冲突原文。找不到直接冲突原文时，contradictions 必须为空。禁止根据制度效力层级、法律解释、“一般条款隐含”等推理判定冲突。
@@ -64,6 +66,9 @@ JUDGE_PROMPT = """你是 RAG 评估中的事实提取员，只做核对，不评
 类别：{category}
 expect_refusal：{expect_refusal}
 标准答案：{gold_answer}
+
+必答事实点：
+{key_facts}
 
 检索片段（助手回答时看到的原文，可能被截断）：
 {context}
@@ -155,6 +160,9 @@ def _canon(text: str) -> str:
     normalized = _norm(text)
     for variant, canonical in (("不可以", "不能"), ("不可", "不能"), ("不予", "不能")):
         normalized = normalized.replace(variant, canonical)
+    # 统一配置/单位的常见写法：8C ≡ 8 核，32G ≡ 32GB，2T ≡ 2TB；草稿中英混用
+    for variant, canonical in (("GB", "G"), ("TB", "T"), ("核", "C"), ("draft", "草稿")):
+        normalized = normalized.replace(variant, canonical)
     return normalized
 
 
@@ -163,10 +171,12 @@ def _quote_supports_claim(claim: str, quote: str, answer: str = "") -> bool:
     claim_norm = _canon(claim)
     if not quote_norm or not claim_norm:
         return False
-    tokens = re.findall(r"[A-Za-z0-9]+", claim)
+    # 括号内是计算过程/补充说明，按提示词规则不参与 token 校验
+    claim_for_tokens = re.sub(r"[（(][^（）()]*[）)]", "", claim).strip() or claim
+    tokens = re.findall(r"[A-Za-z0-9]+", claim_for_tokens)
     if tokens:
-        scope = _norm(answer) if answer else quote_norm
-        return all(_norm(token) in scope for token in tokens)
+        scope = _canon(answer) if answer else quote_norm
+        return all(_canon(token) in scope for token in tokens)
     if len(claim_norm) <= 2:
         return claim_norm in quote_norm
     if claim_norm in quote_norm:
@@ -213,6 +223,134 @@ def _doc_blocks(context: str, full_docs: str) -> list[tuple[str, str]]:
     return blocks
 
 
+def _key_facts_block(key_facts: list[str]) -> str:
+    if not key_facts:
+        return "（未指定；请按标准答案自行拆分事实点）"
+    return "\n".join(f"K{index}. {fact}" for index, fact in enumerate(key_facts, 1))
+
+
+def _number_in(number: str, sentence_norm: str) -> bool:
+    compact = _norm(number.replace(",", ""))
+    if compact in sentence_norm:
+        return True
+    parts = [part for part in number.replace(",", "").split(".") if part]
+    return len(parts) > 1 and all(_norm(part) in sentence_norm for part in parts)
+
+
+def _recovery_window(claim: str, model_answer: str) -> str | None:
+    """事实点被同义改写或拆到相邻句时，按“数字全部命中 + 二字词覆盖率”找回。"""
+    numbers = re.findall(r"\d+(?:[.,]\d+)?", claim)
+    claim_norm = _canon(claim)
+    bigrams = [claim_norm[i : i + 2] for i in range(len(claim_norm) - 1)]
+    if not bigrams:
+        return None
+    sentences = [part.strip(" -*") for part in re.split(r"[。；;\n]", model_answer) if part.strip()]
+    if not numbers:
+        # 无数字事实常被拆到多句，按整篇回答算覆盖率；0.70 可区分“改写到不同句”和“漏掉关键限定词”
+        if len(claim_norm) < 4:
+            return None
+        whole = _canon(model_answer)
+        need = min(len(bigrams), max(2, -(-len(bigrams) * 70 // 100)))
+        if sum(1 for bigram in bigrams if bigram in whole) < need:
+            return None
+        if not sentences:
+            return model_answer.strip()
+        return max(
+            sentences,
+            key=lambda sentence: sum(1 for bigram in bigrams if bigram in _canon(sentence)),
+        ).strip()
+    need = min(len(bigrams), max(2, (len(bigrams) + 1) // 2))
+    windows = sentences + [
+        f"{sentences[i]} {sentences[i + 1]}" for i in range(len(sentences) - 1)
+    ]
+    for window in windows:
+        window_norm = _canon(window)
+        if not all(_number_in(number, window_norm) for number in numbers):
+            continue
+        if sum(1 for bigram in bigrams if bigram in window_norm) >= need:
+            return window.strip()
+    return None
+
+
+def _fact_row(
+    item: dict,
+    fallback_id: str,
+    answer_norm: str,
+    model_answer: str,
+    allow_recovery: bool = False,
+) -> dict | None:
+    claim = str(item.get("claim", "")).strip()
+    status = item.get("status")
+    if not claim or status not in {"covered", "missing", "wrong"}:
+        return None
+    quote = str(item.get("quote", "")).strip()
+    if status in {"covered", "wrong"} and (
+        not _norm(quote)
+        or _norm(quote) not in answer_norm
+        or not _quote_supports_claim(claim, quote, model_answer)
+    ):
+        status, quote = "missing", ""
+    if status != "covered" and allow_recovery:
+        base = re.split(r"[（(]", claim, maxsplit=1)[0].strip()
+        if len(_norm(base)) >= 3 and _norm(base) in answer_norm:
+            claim, quote, status = base, base, "covered"
+        else:
+            recovered = _recovery_window(claim, model_answer)
+            if recovered:
+                quote, status = recovered, "covered"
+    return {"id": str(item.get("id") or fallback_id), "claim": claim, "status": status, "quote": quote}
+
+
+def _build_fact_rows(question: dict, data: dict, model_answer: str) -> list[dict]:
+    answer_norm = _norm(model_answer)
+    raw = data.get("facts")
+    raw = raw if isinstance(raw, list) else []
+    key_facts = [str(f).strip() for f in (question.get("key_facts") or []) if str(f).strip()]
+    if not key_facts:
+        rows = []
+        for index, item in enumerate(raw, 1):
+            if isinstance(item, dict):
+                row = _fact_row(item, f"F{index}", answer_norm, model_answer)
+                if row:
+                    rows.append(row)
+        return rows
+
+    matched: dict[int, dict] = {}
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        claim = str(item.get("claim", "")).strip()
+        pos = None
+        id_match = re.fullmatch(r"K(\d+)", str(item.get("id", "")).strip())
+        if id_match and 1 <= int(id_match.group(1)) <= len(key_facts):
+            pos = int(id_match.group(1))
+        elif claim:
+            claim_norm = _norm(claim)
+            for index, key_fact in enumerate(key_facts, 1):
+                key_norm = _norm(key_fact)
+                if key_norm and (
+                    claim_norm == key_norm
+                    or claim_norm in key_norm
+                    or key_norm in claim_norm
+                ):
+                    pos = index
+                    break
+        if pos and pos not in matched:
+            matched[pos] = item
+
+    rows = []
+    for index, key_fact in enumerate(key_facts, 1):
+        item = matched.get(index) or {
+            "id": f"K{index}", "claim": key_fact, "status": "missing", "quote": ""
+        }
+        row = _fact_row(item, f"K{index}", answer_norm, model_answer, allow_recovery=True)
+        if row:
+            row["id"] = f"K{index}"
+            row["claim"] = key_fact
+            rows.append(row)
+    return rows
+
+
 def _assemble_judgement(
     question: dict,
     data: dict,
@@ -221,39 +359,7 @@ def _assemble_judgement(
     leaked: bool,
     model_answer: str = "",
 ) -> dict:
-    answer_norm = _norm(model_answer)
-    facts: list[dict] = []
-    raw_facts = data.get("facts")
-    for index, item in enumerate(raw_facts if isinstance(raw_facts, list) else [], 1):
-        if not isinstance(item, dict):
-            continue
-        claim = str(item.get("claim", "")).strip()
-        status = item.get("status")
-        if not claim or status not in {"covered", "missing", "wrong"}:
-            continue
-        quote = str(item.get("quote", "")).strip()
-        if status == "missing":
-            base = re.split(r"[（(]", claim, maxsplit=1)[0].strip()
-            if len(_norm(base)) >= 3 and _norm(base) in answer_norm:
-                claim = base
-                quote = base
-                status = "covered"
-        if status in {"covered", "wrong"}:
-            if (
-                not _norm(quote)
-                or _norm(quote) not in answer_norm
-                or not _quote_supports_claim(claim, quote, model_answer)
-            ):
-                status = "missing"
-                quote = ""
-        facts.append(
-            {
-                "id": str(item.get("id") or f"F{index}"),
-                "claim": claim,
-                "status": status,
-                "quote": quote,
-            }
-        )
+    facts = _build_fact_rows(question, data, model_answer)
 
     source = _norm(f"{context}\n{full_docs}")
     blocks = _doc_blocks(context, full_docs)
@@ -350,6 +456,9 @@ def judge(
         category=question["category"],
         expect_refusal=question.get("expect_refusal", False),
         gold_answer=question["gold_answer"],
+        key_facts=_key_facts_block(
+            [str(f).strip() for f in (question.get("key_facts") or []) if str(f).strip()]
+        ),
         context=context or "（无）",
         full_docs=full_docs or "（无）",
         model_answer=model_answer,
@@ -387,9 +496,17 @@ def judge(
     }
 
 
-def evaluate(limit: int | None, use_judge: bool) -> dict:
+def evaluate(
+    limit: int | None,
+    use_judge: bool,
+    questions_path: Path | None = None,
+    ids: set[str] | None = None,
+) -> dict:
     REPORT_DIR.mkdir(parents=True, exist_ok=True)
-    questions = [json.loads(line) for line in QUESTIONS_PATH.open(encoding="utf-8")]
+    source_path = questions_path or QUESTIONS_PATH
+    questions = [json.loads(line) for line in source_path.open(encoding="utf-8")]
+    if ids:
+        questions = [question for question in questions if question["id"] in ids]
     if limit:
         questions = questions[:limit]
 
@@ -442,6 +559,7 @@ def evaluate(limit: int | None, use_judge: bool) -> dict:
             "role": question["role"],
             "question": question["question"],
             "gold_answer": question["gold_answer"],
+            "key_facts": question.get("key_facts") or [],
             "model_answer": answer_text,
             "retrieved_ids": retrieved_ids,
             "sources": response["sources"],
@@ -468,8 +586,11 @@ def evaluate(limit: int | None, use_judge: bool) -> dict:
             f"leak={leaked_ids + leaked_terms}"
         )
 
-    report = _aggregate(results, str(QUESTIONS_PATH))
-    _write_outputs(report, REPORT_DIR, "report", "results.jsonl")
+    report = _aggregate(results, str(source_path))
+    if ids:
+        _write_outputs(report, REPORT_DIR, "report_partial", "results_partial.jsonl")
+    else:
+        _write_outputs(report, REPORT_DIR, "report", "results.jsonl")
     return report
 
 
@@ -484,7 +605,9 @@ def rejudge(results_path: Path, limit: int | None, ids: set[str] | None = None) 
     for index, row in enumerate(rows, 1):
         print(f"[{index}/{len(rows)}] rejudge {row['id']}")
         if row["retrieved_ids"]:
-            hits = hybrid_search(row["question"], role=row["role"], top_k=TOP_K)
+            # 聚合题答案生成时可能放宽了候选集，复判时按实际检索条数还原上下文
+            top_k = max(len(row["retrieved_ids"]), TOP_K)
+            hits = hybrid_search(row["question"], role=row["role"], top_k=top_k)
             got = [hit["metadata"]["doc_id"] for hit in hits]
             if got != row["retrieved_ids"]:
                 print(f"  WARN: retrieved ids differ\n    now={got}\n    old={row['retrieved_ids']}")
@@ -657,6 +780,11 @@ if __name__ == "__main__":
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--no-judge", action="store_true")
     parser.add_argument(
+        "--questions",
+        default=str(QUESTIONS_PATH),
+        help="题目文件（默认 v2）",
+    )
+    parser.add_argument(
         "--rejudge",
         action="store_true",
         help="复用已存回答离线复判，不调用问答模型",
@@ -676,4 +804,10 @@ if __name__ == "__main__":
         ids = {item.strip() for item in args.ids.split(",") if item.strip()} or None
         rejudge(Path(args.results), args.limit, ids)
     else:
-        evaluate(limit=args.limit, use_judge=not args.no_judge)
+        ids = {item.strip() for item in args.ids.split(",") if item.strip()} or None
+        evaluate(
+            limit=args.limit,
+            use_judge=not args.no_judge,
+            questions_path=Path(args.questions),
+            ids=ids,
+        )

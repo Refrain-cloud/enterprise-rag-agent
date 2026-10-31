@@ -3,10 +3,10 @@ from __future__ import annotations
 import argparse
 from datetime import date
 
-from src.config import CHAT_MODEL, TOP_K, ROLES, TABLE_TOOL_ENABLED, get_client
+from src.config import AGG_TOP_K, CHAT_MODEL, TOP_K, ROLES, TABLE_TOOL_ENABLED, get_client
 from src.retrieval.search import hybrid_search
 from src.security.policy import can_access, normalize_role
-from src.tools.sql_tool import answer_with_tables
+from src.tools.sql_tool import answer_with_tables, eligible_table_hits, is_aggregation_question
 
 SYSTEM_PROMPT = """你是北辰智造科技的内部知识库助手。请严格依据提供的资料回答。
 
@@ -58,6 +58,13 @@ def _sources(hits: list[dict]) -> list[dict]:
 def answer(question: str, role: str = "普通员工", top_k: int = TOP_K) -> dict:
     role = normalize_role(role)
     hits = hybrid_search(question, role=role, top_k=top_k)
+    # 聚合题的表格文档可能被叙述型文档挤出 top-K：没有任何可访问表格时再放宽候选
+    if (
+        TABLE_TOOL_ENABLED
+        and is_aggregation_question(question)
+        and not eligible_table_hits(hits, role)
+    ):
+        hits = hybrid_search(question, role=role, top_k=max(top_k, AGG_TOP_K))
     best_overall = hybrid_search(question, role=role, top_k=1, ignore_permissions=True)
 
     def _denied() -> dict:

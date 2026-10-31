@@ -36,7 +36,8 @@ SQL_SYSTEM_PROMPT = """你是 SQLite SQL 专家，负责把内部统计问题转
 4. 百分比列存的是百分点（77.5 表示 77.5%）；整体执行率优先用 _summary，或用 累计/预算 计算。
 5. 金额列是数值，空值为 NULL；需要保留行明细时不要省略列。
 6. 结果行数用 LIMIT 50 限制。
-7. 问“最高/最低/最多/最少”时，查询结果必须包含该行对应的数值（如执行率），不能只返回名称。"""
+7. 问“最高/最低/最多/最少”时，查询结果必须包含该行对应的数值（如执行率），不能只返回名称。
+8. 问“超过 N 天/大于 N”时，条件要覆盖所有更高档位：例如账龄超过 90 天应同时包含“90天以上”和“180天以上”，不能只等值匹配一档；“—”或空值不计入。"""
 
 RESTATE_SYSTEM_PROMPT = """你负责把数据库查询结果转述成中文回答。
 规则：
@@ -66,6 +67,9 @@ def eligible_table_hits(hits: list[dict], role: str, max_docs: int = TABLE_MAX_D
         if not doc_id or doc_id in seen:
             continue
         if meta.get("format") not in TABLE_FORMATS:
+            continue
+        # 草稿/过期/被替代的表格不得作为统计口径（如过期的通讯录）
+        if meta.get("status") != "active":
             continue
         if not can_access(role, meta):
             continue

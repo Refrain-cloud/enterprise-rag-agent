@@ -23,6 +23,8 @@ CHUNK_SIZE = int(os.getenv("RAG_CHUNK_SIZE", "700"))
 CHUNK_OVERLAP = int(os.getenv("RAG_CHUNK_OVERLAP", "120"))
 TOP_K = int(os.getenv("RAG_TOP_K", "8"))
 CANDIDATE_K = int(os.getenv("RAG_CANDIDATE_K", "40"))
+# 聚合题需要更宽的候选集，避免表格文档被叙述型文档挤出 top-K
+AGG_TOP_K = int(os.getenv("RAG_AGG_TOP_K", "10"))
 
 ROLES = ("普通员工", "HR", "财务", "销售", "IT", "产品", "管理层")
 
@@ -31,6 +33,7 @@ TABLE_FORMATS = {"csv", "xlsx"}
 AGG_KEYWORDS = (
     "合计", "总计", "总共", "一共", "几笔", "几单",
     "最高", "最低", "最多", "最少", "平均", "统计", "汇总", "占比",
+    "工时", "进度",
 )
 TABLE_MAX_DOCS = int(os.getenv("RAG_TABLE_MAX_DOCS", "3"))
 TABLE_MAX_ROWS = int(os.getenv("RAG_TABLE_MAX_ROWS", "200"))
