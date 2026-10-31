@@ -309,7 +309,7 @@ def _recovery_window(claim: str, model_answer: str) -> str | None:
         if len(claim_norm) < 4:
             return None
         whole = _canon(model_answer)
-        need = min(len(bigrams), max(2, -(-len(bigrams) * 70 // 100)))
+        need = min(len(bigrams), max(2, -(-len(bigrams) * 65 // 100)))
         if sum(1 for bigram in bigrams if bigram in whole) < need:
             return None
         if not sentences:
@@ -328,6 +328,17 @@ def _recovery_window(claim: str, model_answer: str) -> str | None:
             continue
         if sum(1 for bigram in bigrams if bigram in window_norm) >= need:
             return window.strip()
+    # 数字被拆到间隔较远的多句时（如“2024 立项”“2025-10 终止”），按整篇覆盖率兜底
+    whole = _canon(model_answer)
+    if all(_number_in(number, whole) for number in numbers):
+        whole_need = min(len(bigrams), max(2, -(-len(bigrams) * 75 // 100)))
+        if sum(1 for bigram in bigrams if bigram in whole) >= whole_need:
+            if not sentences:
+                return model_answer.strip()
+            return max(
+                sentences,
+                key=lambda sentence: sum(1 for bigram in bigrams if bigram in _canon(sentence)),
+            ).strip()
     return None
 
 
