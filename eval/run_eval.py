@@ -18,7 +18,8 @@ from src.config import CHAT_MODEL, BUILD_DIR, TOP_K
 from src.llm import chat_completion, merge_usage, reset_usage, usage_snapshot
 from src.retrieval.search import hybrid_search, reset_search_stats, search_stats
 
-QUESTIONS_PATH = Path(__file__).resolve().parent / "questions.v3.jsonl"
+# v3 已归档（deprecated），保留用于历史报告复现；v4 是 v3 的超集
+QUESTIONS_PATH = Path(__file__).resolve().parent / "questions.v4.jsonl"
 REPORT_DIR = BUILD_DIR / "eval"
 CORPUS_PATH = BUILD_DIR / "corpus" / "docs.jsonl"
 CITE_PATTERN = re.compile(r"\[([A-Z]+-\d+[A-Z]?)\]")
@@ -2267,7 +2268,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--questions",
         default=str(QUESTIONS_PATH),
-        help="题目文件（默认 v3）",
+        help="题目文件（默认 v4；v3 已归档）",
     )
     parser.add_argument(
         "--report-stem",
