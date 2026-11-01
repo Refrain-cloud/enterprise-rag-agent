@@ -15,8 +15,8 @@ from src.config import (
     TABLE_SAMPLE_ROWS,
     TABLE_SQL_MAX_TOKENS,
     TABLE_TOOL_ENABLED,
-    get_client,
 )
+from src.llm import chat_completion
 from src.security.policy import can_access
 from src.tools.table_loader import (
     LoadedTables,
@@ -230,7 +230,8 @@ def generate_sql(question: str, loaded: LoadedTables, conn: sqlite3.Connection) 
     last_error: Exception | None = None
     fallback: tuple[str, dict] | None = None
     for attempt in range(3):
-        response = get_client().chat.completions.create(
+        response = chat_completion(
+            "sql_generate",
             model=CHAT_MODEL,
             messages=messages,
             temperature=0,
@@ -312,7 +313,8 @@ def compose_answer(
         f"查询结果（共 {result['row_count']} 行"
         f"{'，已截断' if result['truncated'] else ''}）：\n{result_text}"
     )
-    response = get_client().chat.completions.create(
+    response = chat_completion(
+        "sql_restate",
         model=CHAT_MODEL,
         messages=[
             {"role": "system", "content": RESTATE_SYSTEM_PROMPT},

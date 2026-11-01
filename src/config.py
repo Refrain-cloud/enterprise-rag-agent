@@ -30,6 +30,15 @@ CANDIDATE_K = int(os.getenv("RAG_CANDIDATE_K", "40"))
 # 聚合题需要更宽的候选集，避免表格文档被叙述型文档挤出 top-K
 AGG_TOP_K = int(os.getenv("RAG_AGG_TOP_K", "16"))
 
+RERANK_ENABLED = os.getenv("RAG_RERANK", "0") not in {"0", "false", "False"}
+RERANK_MODEL = os.getenv("RAG_RERANK_MODEL", "gte-rerank-v2")
+# 只重排已召回的 top-k，避免把表格文档挤进上下文后改变工具路由
+RERANK_CANDIDATE_K = int(os.getenv("RAG_RERANK_CANDIDATE_K", str(TOP_K)))
+RERANK_BASE_URL = os.getenv(
+    "RAG_RERANK_BASE_URL",
+    "https://dashscope.aliyuncs.com/api/v1/services/rerank/text-rerank/text-rerank",
+)
+
 ROLES = ("普通员工", "HR", "财务", "销售", "IT", "产品", "管理层")
 
 TABLE_TOOL_ENABLED = os.getenv("RAG_TABLE_TOOL", "1") not in {"0", "false", "False"}

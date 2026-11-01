@@ -11,8 +11,8 @@ from src.config import (
     ROLES,
     TABLE_TOOL_ENABLED,
     TOP_K,
-    get_client,
 )
+from src.llm import chat_completion
 from src.retrieval.search import hybrid_search
 from src.security.policy import can_access, normalize_role
 from src.tools.sql_tool import (
@@ -163,7 +163,8 @@ def answer(question: str, role: str = "普通员工", top_k: int = TOP_K) -> dic
             "content": f"当前用户角色：{role}\n\n参考资料：\n{context}\n\n问题：{question}",
         },
     ]
-    response = get_client().chat.completions.create(
+    response = chat_completion(
+        "generate",
         model=CHAT_MODEL,
         messages=messages,
         temperature=0,

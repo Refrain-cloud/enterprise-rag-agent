@@ -10,7 +10,7 @@
 - 生成模型：Qwen（DashScope OpenAI 兼容接口），具体模型由 `configs/` 决定
 - Embedding：`text-embedding-v3`
 - 编排：LangGraph，**只负责路由与状态流转**
-- 检索：Chroma（向量）+ BM25（关键词）+ 元数据过滤；表格数据用 DuckDB / pandas
+- 检索：Chroma（向量）+ BM25（关键词）+ 元数据过滤；可选 rerank（DashScope `gte-rerank-v2`，`RAG_RERANK=1` 开启，默认关闭，只重排已召回的 top-k）；表格数据用 DuckDB / pandas
 - 服务：FastAPI + 简易 Web Demo（角色切换、引用展示）
 - 所有密钥从环境变量读取，禁止硬编码
 

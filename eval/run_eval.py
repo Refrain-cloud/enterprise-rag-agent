@@ -13,8 +13,9 @@ from functools import lru_cache
 from pathlib import Path
 
 from src.agent.ask import answer
-from src.config import CHAT_MODEL, BUILD_DIR, TOP_K, get_client
-from src.retrieval.search import hybrid_search
+from src.config import CHAT_MODEL, BUILD_DIR, TOP_K
+from src.llm import chat_completion, merge_usage, reset_usage, usage_snapshot
+from src.retrieval.search import hybrid_search, reset_search_stats, search_stats
 
 QUESTIONS_PATH = Path(__file__).resolve().parent / "questions.v3.jsonl"
 REPORT_DIR = BUILD_DIR / "eval"
@@ -32,6 +33,7 @@ ANSWER_SOURCE_FILES = (
         for path in (ROOT / "src" / name).rglob("*.py")
     ),
     ROOT / "src" / "config.py",
+    ROOT / "src" / "llm.py",
     BUILD_DIR / "corpus" / "docs.jsonl",
     BUILD_DIR / "index" / "chunks.jsonl",
     BUILD_DIR / "index" / "bm25.pkl",
@@ -229,7 +231,8 @@ def _is_direct_contradiction(claim: str, evidence: str) -> bool:
     prompt = CONTRADICTION_CHECK_PROMPT.format(claim=claim, evidence=evidence[:1500])
     for attempt in range(2):
         try:
-            response = get_client().chat.completions.create(
+            response = chat_completion(
+                "contradiction",
                 model=CHAT_MODEL,
                 messages=[{"role": "user", "content": prompt}],
                 temperature=0,
@@ -926,7 +929,8 @@ def judge(
     last_error: Exception | None = None
     for attempt in range(3):
         try:
-            response = get_client().chat.completions.create(
+            response = chat_completion(
+                "judge",
                 model=CHAT_MODEL,
                 messages=[{"role": "user", "content": prompt}],
                 temperature=0,
@@ -976,6 +980,8 @@ def evaluate(
     for index, question in enumerate(questions, 1):
         print(f"[{index}/{len(questions)}] {question['id']} {question['question']}")
         started = time.time()
+        reset_usage()
+        reset_search_stats()
         try:
             response = answer(question["question"], role=question["role"])
         except Exception as exc:
@@ -986,6 +992,8 @@ def evaluate(
                 "denied": False,
                 "route": "error",
             }
+        generation_usage = usage_snapshot()
+        retrieval_stats = search_stats()
 
         retrieved_ids = [hit["metadata"]["doc_id"] for hit in response["hits"]]
         gold_ids = question.get("gold_doc_ids", [])
@@ -1007,6 +1015,7 @@ def evaluate(
             "contradictions": [], "unsupported_claims": [], "refused": None,
         }
         runs: list[dict] = []
+        reset_usage()
         if use_judge:
             runs = [
                 judge(
@@ -1019,6 +1028,7 @@ def evaluate(
                 for _ in range(max(1, judge_repeats))
             ]
             judged = _modal_judgement(runs) if len(runs) > 1 else runs[0]
+        judge_usage = usage_snapshot()
 
         result = {
             "id": question["id"],
@@ -1047,6 +1057,10 @@ def evaluate(
             "answer_fingerprint": answer_fp,
             "judge_fingerprint": _judge_fingerprint(question),
             "latency_s": round(time.time() - started, 2),
+            "retrieval_calls": retrieval_stats["calls"],
+            "retrieval_latency_s": retrieval_stats["elapsed_s"],
+            "generation_usage": generation_usage,
+            "judge_usage": judge_usage,
         }
         if len(runs) > 1:
             result["judge_repeat_scores"] = [run["score"] for run in runs]
@@ -1198,6 +1212,7 @@ def rejudge(
     judge_repeats = max(1, judge_repeats)
 
     results: list[dict] = []
+    reset_usage()
     for index, row in enumerate(rows, 1):
         print(f"[{index}/{len(rows)}] rejudge {row['id']}")
         hits = _hits_for_row(row)
@@ -1222,6 +1237,7 @@ def rejudge(
 
     report = _aggregate(results, str(results_path))
     report["rejudged_from"] = str(results_path)
+    report["cost"] = _judge_cost_summary(usage_snapshot(), len(results))
     if judge_repeats > 1:
         report["judge_repeats"] = judge_repeats
         report["judge_score_agreement"] = (
@@ -1233,6 +1249,90 @@ def rejudge(
         )
     _write_outputs(report, REPORT_DIR, "report_rejudge", "results_rejudge.jsonl")
     return report
+
+
+def _avg(values: list[float]) -> float | None:
+    return round(sum(values) / len(values), 6) if values else None
+
+
+def _cost_summary(results: list[dict]) -> dict | None:
+    generations = [
+        result["generation_usage"]
+        for result in results
+        if result.get("generation_usage")
+    ]
+    judges = [result["judge_usage"] for result in results if result.get("judge_usage")]
+    if not generations and not judges:
+        return None
+    generation = merge_usage(*generations)
+    judge_usage = merge_usage(*judges)
+    total = merge_usage(generation, judge_usage)
+    count = len(results)
+    rerank = (generation.get("by_kind") or {}).get("rerank") or {}
+    return {
+        "currency": "CNY",
+        "generation": generation,
+        "judge": judge_usage,
+        "total": total,
+        "per_question": {
+            "count": count,
+            "avg_total_cost_cny": round(total["cost_cny"] / count, 6) if count else None,
+            "avg_generation_cost_cny": (
+                round(generation["cost_cny"] / count, 6) if count else None
+            ),
+            "avg_judge_cost_cny": round(judge_usage["cost_cny"] / count, 6) if count else None,
+            "avg_latency_s": _avg(
+                [result["latency_s"] for result in results if result.get("latency_s") is not None]
+            ),
+            "avg_retrieval_latency_s": _avg(
+                [
+                    result["retrieval_latency_s"]
+                    for result in results
+                    if result.get("retrieval_latency_s") is not None
+                ]
+            ),
+            "avg_retrieval_calls": _avg(
+                [
+                    result["retrieval_calls"]
+                    for result in results
+                    if result.get("retrieval_calls") is not None
+                ]
+            ),
+            "avg_rerank_latency_s": (
+                round(rerank.get("elapsed_s", 0.0) / count, 4) if count else None
+            ),
+            "rerank_calls_per_question": (
+                round(rerank.get("calls", 0) / count, 3) if count else None
+            ),
+        },
+    }
+
+
+def _phase_usage(usage: dict, kind: str) -> dict:
+    return (usage.get("by_kind") or {}).get(kind) or {
+        "calls": 0,
+        "prompt_tokens": 0,
+        "completion_tokens": 0,
+        "total_tokens": 0,
+        "cost_cny": 0.0,
+        "elapsed_s": 0.0,
+    }
+
+
+def _judge_cost_summary(usage: dict, count: int) -> dict:
+    # 复判稳定性时会重新检索上下文，embedding 费用单列，避免混入 judge 单价
+    judge = _phase_usage(usage, "judge")
+    return {
+        "currency": "CNY",
+        "judge": judge,
+        "embedding": _phase_usage(usage, "embedding"),
+        "total": usage,
+        "per_question": {
+            "count": count,
+            "avg_total_cost_cny": round(usage["cost_cny"] / count, 6) if count else None,
+            "avg_judge_cost_cny": round(judge["cost_cny"] / count, 6) if count else None,
+        },
+    }
 
 
 def _run_metrics(judged_rows: list[dict]) -> dict:
@@ -1267,6 +1367,7 @@ def judge_stability(
     rows = _rows_for_judging(results_path, limit, ids, allow_stale)
 
     records: list[dict] = []
+    reset_usage()
     for index, row in enumerate(rows, 1):
         hits = _hits_for_row(row)
         context = _judge_excerpt(hits)
@@ -1425,6 +1526,7 @@ def judge_stability(
             }
             for record in changed
         ],
+        "cost": _judge_cost_summary(usage_snapshot(), len(records)),
         "records": records,
     }
     _write_stability_outputs(report, output_stem)
@@ -1460,6 +1562,18 @@ def _write_stability_outputs(report: dict, stem: str = "report_stability") -> No
         f"- 忠实判定完全一致：{_fmt_rate(agreement['faithful'])}",
         f"- 拒答判定完全一致：{_fmt_rate(agreement['refusal'])}",
         f"- 四项全部一致：{_fmt_rate(agreement['all'])}",
+        *(
+            [
+                f"- judge 费用：约 {report['cost']['judge']['cost_cny']:.4f} 元"
+                f"（{report['cost']['judge']['calls']} 次调用，"
+                f"{report['cost']['judge']['total_tokens']} tokens，"
+                f"均摊 {report['cost']['per_question']['avg_judge_cost_cny']:.6f} 元/题）",
+                f"- 复判检索 embedding：约 {report['cost']['embedding']['cost_cny']:.4f} 元"
+                f"（{report['cost']['embedding']['calls']} 次调用）",
+            ]
+            if report.get("cost")
+            else []
+        ),
         "",
         "## 各轮聚合指标",
         "",
@@ -1654,6 +1768,7 @@ def _aggregate(results: list[dict], source: str) -> dict:
             "route_counts": dict(sorted(Counter(result["route"] for result in results).items())),
         },
         "by_category": category_metrics,
+        "cost": _cost_summary(results),
         "results": results,
     }
 
@@ -1696,6 +1811,21 @@ def _write_markdown(report: dict, path: Path) -> None:
         f"- 权限合规率：{metrics['permission_ok_rate']}",
         f"- 权限泄漏数：{metrics['permission_leaks']}",
         f"- 路由分布：{metrics['route_counts']}",
+        *(
+            [
+                f"- 生成 token：{cost['generation']['total_tokens']}（{cost['generation']['calls']} 次调用，"
+                f"约 {cost['generation']['cost_cny']:.4f} 元）",
+                f"- judge token：{cost['judge']['total_tokens']}（{cost['judge']['calls']} 次调用，"
+                f"约 {cost['judge']['cost_cny']:.4f} 元）",
+                f"- 预估总费用：约 {cost['total']['cost_cny']:.4f} 元"
+                f"（均摊 {cost['per_question']['avg_total_cost_cny']:.6f} 元/题）",
+                f"- 平均延迟：{_fmt_float(cost['per_question']['avg_latency_s'])} s"
+                f"（检索 {_fmt_float(cost['per_question']['avg_retrieval_latency_s'])} s，"
+                f"rerank {_fmt_float(cost['per_question']['avg_rerank_latency_s'])} s/题）",
+            ]
+            if (cost := report.get("cost"))
+            else []
+        ),
         f"- 回答指纹：{', '.join(fingerprints.get('answer') or []) or '-'}",
         f"- 判定指纹：{', '.join(fingerprints.get('judge') or []) or '-'}",
         *(

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import pickle
+import time
 from functools import lru_cache
 
 import chromadb
@@ -12,11 +13,28 @@ from src.config import (
     EMBED_DIM,
     EMBED_MODEL,
     INDEX_DIR,
+    RERANK_CANDIDATE_K,
+    RERANK_ENABLED,
     TOP_K,
-    get_client,
 )
+from src.llm import embed as llm_embed
 from src.retrieval.index import COLLECTION_NAME
+from src.retrieval.rerank import rerank_documents
 from src.security.policy import allowed_classifications, can_access
+
+_SEARCH_STATS = {"calls": 0, "elapsed_s": 0.0}
+
+
+def reset_search_stats() -> None:
+    _SEARCH_STATS["calls"] = 0
+    _SEARCH_STATS["elapsed_s"] = 0.0
+
+
+def search_stats() -> dict:
+    return {
+        "calls": _SEARCH_STATS["calls"],
+        "elapsed_s": round(_SEARCH_STATS["elapsed_s"], 4),
+    }
 
 
 @lru_cache(maxsize=1)
@@ -35,8 +53,8 @@ def _load_resources():
 
 @lru_cache(maxsize=128)
 def _embed_query(query: str) -> list[float]:
-    response = get_client().embeddings.create(
-        model=EMBED_MODEL, input=[query], dimensions=EMBED_DIM
+    response = llm_embed(
+        "embedding", model=EMBED_MODEL, input=[query], dimensions=EMBED_DIM
     )
     return response.data[0].embedding
 
@@ -55,6 +73,20 @@ def hybrid_search(
     role: str = "普通员工",
     top_k: int = TOP_K,
     ignore_permissions: bool = False,
+) -> list[dict]:
+    started = time.perf_counter()
+    try:
+        return _hybrid_search(query, role, top_k, ignore_permissions)
+    finally:
+        _SEARCH_STATS["calls"] += 1
+        _SEARCH_STATS["elapsed_s"] += time.perf_counter() - started
+
+
+def _hybrid_search(
+    query: str,
+    role: str,
+    top_k: int,
+    ignore_permissions: bool,
 ) -> list[dict]:
     by_id, bm25_payload, collection = _load_resources()
     query_embedding = _embed_query(query)
@@ -99,7 +131,16 @@ def hybrid_search(
         [vector_ranked[: CANDIDATE_K], bm25_ranked[: CANDIDATE_K]],
         weights=[1.0, 0.8],
     )
-    ordered = sorted(fused.items(), key=lambda item: item[1], reverse=True)[:top_k]
+    candidate_k = max(top_k, RERANK_CANDIDATE_K) if RERANK_ENABLED else top_k
+    ordered = sorted(fused.items(), key=lambda item: item[1], reverse=True)[:candidate_k]
+    if RERANK_ENABLED and ordered:
+        ranked = rerank_documents(
+            query,
+            [by_id[chunk_id]["text"][:2000] for chunk_id, _ in ordered],
+            top_n=top_k,
+        )
+        if ranked:
+            ordered = [ordered[index] for index, _ in ranked][:top_k]
     results: list[dict] = []
     for chunk_id, score in ordered:
         chunk = by_id[chunk_id]
