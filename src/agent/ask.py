@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import re
+from collections import defaultdict
 from datetime import date
 
 from src.config import (
@@ -65,6 +66,71 @@ def _format_context(hits: list[dict]) -> str:
 
 
 CITE_PATTERN = re.compile(r"\[([A-Z]{2,}-\d+[A-Z]?)\]")
+
+# 结构化字段校验：从“字段：值”或两列表格行中取字段名，若回答里只出现取值而缺字段名，
+# 判为字段合并并重试一次。只使用检索到的原文，不读取题目 key_facts。
+STRUCTURED_LINE_RE = re.compile(r"^\s*([^|：:\n]{1,24}?)\s*[：:]\s*(.{1,40}?)\s*$")
+TABLE_ROW_RE = re.compile(r"^\s*([^|\n]{1,24}?)\s*\|\s*([^|\n]{1,40}?)\s*$")
+VALUE_TOKEN_RE = re.compile(r"\d{4}-\d{2}-\d{2}|[A-Za-z]\d{1,4}|\d{1,4}[A-Za-z]|\d{3,}")
+GENERIC_FIELD_LABELS = {"项", "内容", "维度", "评分", "字段名", "取值", "备注", "说明"}
+# 模型有时把提示词里的“字段名”当成字面标签输出，属于确定性问题，直接去掉前缀即可
+LITERAL_FIELD_PREFIX_RE = re.compile(r"^[ \t]*字段名\s*[：:]\s*", re.MULTILINE)
+
+
+def _norm_field_text(text: str) -> str:
+    return re.sub(r"\s+", "", text).lower()
+
+
+def _strip_literal_field_prefix(text: str) -> str:
+    return LITERAL_FIELD_PREFIX_RE.sub("", text)
+
+
+def _structured_candidates(hits: list[dict], cited_ids: set[str]) -> dict[str, list[str]]:
+    """收集已引用文档中的（字段名 → 可能的取值序列），用于确定性格式校验。"""
+    candidates: dict[str, list[str]] = defaultdict(list)
+    for hit in hits:
+        meta = hit["metadata"]
+        if meta["doc_id"] not in cited_ids:
+            continue
+        for line in hit["text"].splitlines():
+            if set(line.strip()) <= {"|", "-", " ", ":"}:
+                continue
+            match = TABLE_ROW_RE.match(line) or STRUCTURED_LINE_RE.match(line)
+            if not match:
+                continue
+            label, value = match.group(1).strip(), match.group(2).strip()
+            # 字段名应为短标签：含数字的标题行（如“版本 2026.1 生效日期”）不是字段
+            if (
+                not label
+                or not value
+                or label in GENERIC_FIELD_LABELS
+                or len(label) > 12
+                or re.search(r"[\d=＝]", label)
+            ):
+                continue
+            candidates[label].append(value)
+    return candidates
+
+
+def _structured_field_violations(text: str, hits: list[dict]) -> list[str]:
+    cited_ids = set(CITE_PATTERN.findall(text))
+    if not cited_ids:
+        return []
+    answer_norm = _norm_field_text(text)
+    violations: list[str] = []
+    for label, values in _structured_candidates(hits, cited_ids).items():
+        if _norm_field_text(label) in answer_norm:
+            continue
+        if any(
+            token
+            and re.search(
+                rf"(?<![A-Za-z0-9]){re.escape(token)}(?![A-Za-z0-9])", text
+            )
+            for value in values
+            for token in VALUE_TOKEN_RE.findall(value)
+        ):
+            violations.append(label)
+    return sorted(set(violations))
 
 
 def _ensure_draft_disclosure(text: str, hits: list[dict]) -> str:
@@ -171,14 +237,55 @@ def answer(question: str, role: str = "普通员工", top_k: int = TOP_K) -> dic
         max_tokens=900,
         seed=GENERATION_SEED,
     )
+    text = response.choices[0].message.content.strip()
+    stripped = _strip_literal_field_prefix(text)
+    literal_prefix_stripped = stripped != text
+    text = stripped
+    violations = _structured_field_violations(text, hits)
+    format_check = {
+        "violations": violations,
+        "retried": False,
+        "remaining": [],
+        "literal_prefix_stripped": literal_prefix_stripped,
+    }
+    if violations:
+        correction = (
+            "上一版回答缺少以下字段名或把字段与其它内容合并："
+            f"{'、'.join(violations)}。请保留原有事实与引用，按“字段名：取值”逐行重写，"
+            "字段名须与资料表格一致，不得把多个字段合并成一句。"
+        )
+        retry = chat_completion(
+            "generate_retry",
+            model=CHAT_MODEL,
+            messages=[
+                *messages,
+                {"role": "assistant", "content": text},
+                {"role": "user", "content": correction},
+            ],
+            temperature=0,
+            max_tokens=900,
+            seed=GENERATION_SEED,
+        )
+        retry_text = _strip_literal_field_prefix(
+            retry.choices[0].message.content.strip()
+        )
+        remaining = _structured_field_violations(retry_text, hits)
+        format_check.update(
+            {
+                "retried": True,
+                "remaining": remaining,
+                "fixed": not remaining,
+            }
+        )
+        if len(remaining) <= len(violations):
+            text = retry_text
     return {
-        "answer": _ensure_draft_disclosure(
-            response.choices[0].message.content.strip(), hits
-        ),
+        "answer": _ensure_draft_disclosure(text, hits),
         "sources": _sources(hits),
         "hits": hits,
         "denied": False,
         "route": "rag",
+        "format_check": format_check,
     }
 
 
