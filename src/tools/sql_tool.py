@@ -47,7 +47,9 @@ SQL_SYSTEM_PROMPT = """你是 SQLite SQL 专家，负责把内部统计问题转
 5. 金额列是数值，空值为 NULL；需要保留行明细时不要省略列。
 6. 结果行数用 LIMIT 50 限制；汇总行与排名行用 UNION ALL 合并时，排名部分的 ORDER BY/LIMIT 必须写在独立子查询里（如 SELECT * FROM (SELECT ... ORDER BY ... LIMIT 1)），否则末尾的 ORDER BY/LIMIT 会把汇总行一起裁掉。
 7. 问“最高/最低/最多/最少”时，必须直接查明细表并返回该行的名称与数值（如 SELECT "成本中心","执行率" ... ORDER BY "执行率" DESC LIMIT 1），不能只返回名称，也不要用子查询只取名称。
-8. 问“超过 N 天/大于 N”时，条件要覆盖所有更高档位：例如账龄超过 90 天应同时包含“90天以上”和“180天以上”，不能只等值匹配一档；“—”或空值不计入。"""
+8. 问“超过 N 天/大于 N”时，条件要覆盖所有更高档位：例如账龄超过 90 天应同时包含“90天以上”和“180天以上”，不能只等值匹配一档；“—”或空值不计入。
+9. 问“还提示了哪些问题/还有什么异常/备注”时，除“结论”异常外，还必须包含“备注”非空的记录（即使结论为正常），并返回检查项、读数（数值列）、日期和备注内容。
+10. 问“表头金额/正文金额与明细合计是否一致”时：表头金额只出现在表外说明中，明细表里没有；查询只返回明细合计（SUM 明细金额），不要用 _summary 的“合计”行冒充表头金额；回答时用表外说明中的表头金额与明细合计比较，不一致要写出差额。"""
 
 RESTATE_SYSTEM_PROMPT = """你负责把数据库查询结果转述成中文回答。
 规则：
@@ -63,11 +65,26 @@ VERSION_MARKERS = (
     "以哪份文件为准", "现行版本", "哪一版", "最新版", "是否废止", "已经废止",
     "原来的", "还在吗", "是否还在",
 )
+# 表头金额写在正文而非明细行，表内取不到，交给 RAG 对照原文。
+TABLE_EXCLUDE_MARKERS = ("表头",)
+# 只有出现明确的数值诉求才走表格工具；“报价最低的 B 家”这类比较级不是聚合诉求。
+NUMERIC_DEMAND_MARKERS = (
+    "多少", "几笔", "几单", "几人", "几台", "几个", "几次", "几条",
+    "合计", "总计", "总共", "一共", "数量", "金额", "占比", "平均",
+)
+# 同时要求解释异常/备注的混合题交给 RAG，SQL 转述容易丢掉备注里的细节。
+NARRATIVE_ASK_MARKERS = ("还提示", "还有哪些", "主要异常", "异常是什么")
 
 
 def is_aggregation_question(question: str) -> bool:
     # 版本权威性问题需要结合状态/生效日期/废止声明判断，不能只做表内统计。
     if any(marker in question for marker in VERSION_MARKERS):
+        return False
+    if any(marker in question for marker in TABLE_EXCLUDE_MARKERS):
+        return False
+    if any(marker in question for marker in NARRATIVE_ASK_MARKERS):
+        return False
+    if not any(marker in question for marker in NUMERIC_DEMAND_MARKERS):
         return False
     return any(keyword in question for keyword in AGG_KEYWORDS)
 
@@ -179,10 +196,24 @@ def _schema_text(loaded: LoadedTables) -> str:
     return "\n\n".join(blocks)
 
 
+MEASURE_WORDS = (
+    "金额", "合计", "总计", "数量", "笔数", "单数", "人数", "工时",
+    "成本", "费用", "收入", "预算", "实际", "占比", "执行率", "进度", "评分",
+)
 RANK_WORDS = ("最高", "最低", "最多", "最少", "最大", "最小")
 SUMMARY_WORDS = ("整体", "合计", "汇总", "总计", "总共", "一共")
 ENTITY_WORDS = ("成本中心", "项目", "部门", "姓名", "客户", "科目", "产品", "供应商", "职级", "门店", "渠道")
 ENTITY_ASK_WORDS = ("哪个", "哪家", "谁", "哪一个", "哪些")
+
+
+def _measure_all_null(result: dict) -> bool:
+    """聚合结果里以“金额/合计/数量”等命名的列全为空，说明查错了表。"""
+    for index, name in enumerate(result["columns"]):
+        if not any(word in name for word in MEASURE_WORDS):
+            continue
+        if not any(row[index] not in (None, "") for row in result["rows"]):
+            return True
+    return False
 
 
 def _numeric_column_count(result: dict) -> int:
@@ -389,6 +420,9 @@ def answer_with_tables(question: str, role: str, hits: list[dict]) -> dict | Non
             sql, result = generate_sql(question, loaded, conn)
         finally:
             conn.close()
+        # 0 行或数值列全空，往往说明文档不对或聚合口径不适用，交给 RAG 对照原文
+        if result["row_count"] == 0 or _measure_all_null(result):
+            return None
         answer = compose_answer(question, role, loaded, sql, result)
     except Exception as exc:
         print(f"[table_tool] 回退到向量问答：{type(exc).__name__}: {exc}", file=sys.stderr)

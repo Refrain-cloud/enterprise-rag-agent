@@ -36,7 +36,8 @@ SYSTEM_PROMPT = """你是北辰智造科技的内部知识库助手。请严格�
 7. 对“能否/可不可以/能不能/是否允许”类问题，除给出允许或禁止的结论外，必须写出资料中的例外条件或合规替代做法（例如“改用公司内部部署的模型或先脱敏”）；资料没有时不要臆造。
 8. 引用表格或结构化字段时，保留字段名与取值的对应关系（如“目标职级：P4”“薪资：18K 以内”），不要把不同字段合并改写。当回答需要给出结构化字段（如姓名、职级、薪资、结论、日期等）时，必须逐行输出“字段名：取值”，冒号前直接写资料表格中的字段名（如“目标职级：P4”），不要写“字段名”“取值”这类字面标签；字段名须与资料表格完全一致；表格中同一对象、同一行的字段是一个整体，必须完整逐行列出（对象、日期、职级、结论、数值等），不能只列问题字面问到的字段；表格与正文简写不一致时以表格为准，不得沿用“建议”句里的简写，不得把多个字段合并成一句。
 9. 区分“客户确认/正式承诺”与“内部计划”：会议纪要、拜访记录、销售预测中的日期、方案或目标，若未标明客户确认或未形成正式合同，只能表述为内部计划/建议，并写出前提条件；不得写成已确定的重启时间或交付承诺。
-10. 回答使用专业中文；须完整覆盖资料中与问题相关的功能、条件、限制和版本状态，完整性优先于简洁。"""
+10. 回答使用专业中文；须完整覆盖资料中与问题相关的功能、条件、限制和版本状态，完整性优先于简洁。
+11. 问“表头/正文金额与明细合计是否一致”时，逐份文档用两三行写出表头（或正文）金额、明细合计、差额和是否一致，不要逐项重算明细加总，也不要展开验算过程；不得把汇总行或折扣后的合计当作表头金额，不一致时说明不能直接采信表头金额。"""
 
 
 def _system_prompt() -> str:
@@ -230,12 +231,14 @@ def answer(question: str, role: str = "普通员工", top_k: int = TOP_K) -> dic
             "content": f"当前用户角色：{role}\n\n参考资料：\n{context}\n\n问题：{question}",
         },
     ]
+    # 表头与明细对比需要覆盖两份文档，给更长的输出预算
+    max_tokens = 1200 if ("表头" in question and "明细" in question) else 900
     response = chat_completion(
         "generate",
         model=CHAT_MODEL,
         messages=messages,
         temperature=0,
-        max_tokens=900,
+        max_tokens=max_tokens,
         seed=GENERATION_SEED,
     )
     text = response.choices[0].message.content.strip()
@@ -265,7 +268,7 @@ def answer(question: str, role: str = "普通员工", top_k: int = TOP_K) -> dic
                 {"role": "user", "content": correction},
             ],
             temperature=0,
-            max_tokens=900,
+            max_tokens=max_tokens,
             seed=GENERATION_SEED,
         )
         retry_text = _strip_literal_field_prefix(
