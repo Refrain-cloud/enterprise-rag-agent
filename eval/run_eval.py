@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import inspect
 import json
 import os
 import re
@@ -15,7 +16,7 @@ from src.agent.ask import answer
 from src.config import CHAT_MODEL, BUILD_DIR, TOP_K, get_client
 from src.retrieval.search import hybrid_search
 
-QUESTIONS_PATH = Path(__file__).resolve().parent / "questions.v2.jsonl"
+QUESTIONS_PATH = Path(__file__).resolve().parent / "questions.v3.jsonl"
 REPORT_DIR = BUILD_DIR / "eval"
 CORPUS_PATH = BUILD_DIR / "corpus" / "docs.jsonl"
 CITE_PATTERN = re.compile(r"\[([A-Z]+-\d+[A-Z]?)\]")
@@ -60,9 +61,79 @@ def _answer_fingerprint() -> str:
     return hashlib.sha256("\n".join(parts).encode("utf-8")).hexdigest()[:16]
 
 
+# judge 指纹只覆盖判定语义；报告、CLI、稳定性统计的改动不应污染判定凭据。
+JUDGE_LOGIC_CONSTANTS = (
+    "JUDGE_PROMPT",
+    "CONTRADICTION_CHECK_PROMPT",
+    "REFUSAL_MARKERS",
+    "STRICT_REFUSAL_MARKERS",
+    "ABSENCE_REFUSAL_MARKERS",
+    "CITE_PATTERN",
+    "FULL_DOC_CHARS",
+    "_ENUM_PREDICATE_MARKERS",
+    "_ENUM_ACTION_SYNONYMS",
+    "_NEGATED_CLAIM",
+    "_REJECTION_MARKERS",
+    "_IDENTIFIER_TOKEN",
+    "_WORD_STOPWORDS",
+    "_NEGATION",
+)
+
+JUDGE_LOGIC_FUNCTIONS = (
+    "judge",
+    "_assemble_judgement",
+    "_build_fact_rows",
+    "_fact_row",
+    "_recovery_window",
+    "_word_level_recovery",
+    "_compound_parts",
+    "_compound_recovery",
+    "_enumeration_parts",
+    "_enumeration_recovery",
+    "_predicate_norm",
+    "_predicate_present",
+    "_negation_recovery",
+    "_quote_supports_claim",
+    "_parse_judge_json",
+    "_escape_inner_quotes",
+    "_key_facts_block",
+    "_is_direct_contradiction",
+    "_looks_like_contradiction",
+    "_agrees_on_discontinuation",
+    "_doc_blocks",
+    "_norm",
+    "_canon",
+    "_number_in",
+    "_claim_numbers",
+    "_content_words",
+    "_load_doc_texts",
+    "_judge_excerpt",
+    "_full_docs_context",
+)
+
+
+def _constant_source(value: object) -> str:
+    # 集合/正则的默认 repr 可能受哈希随机化或对象地址影响，指纹需稳定
+    if isinstance(value, re.Pattern):
+        return f"{value.pattern}|{value.flags}"
+    if isinstance(value, (set, frozenset)):
+        return ",".join(sorted(map(str, value)))
+    if isinstance(value, (list, tuple)):
+        return ",".join(map(str, value))
+    return str(value)
+
+
 @lru_cache(maxsize=1)
 def _judge_code_fingerprint() -> str:
-    return _hash_file(Path(__file__).resolve())
+    parts = [
+        f"{name}:{_constant_source(globals().get(name))}"
+        for name in JUDGE_LOGIC_CONSTANTS
+    ]
+    for name in JUDGE_LOGIC_FUNCTIONS:
+        function = globals().get(name)
+        source = inspect.getsource(function) if callable(function) else ""
+        parts.append(f"{name}:\n{source}")
+    return hashlib.sha256("\n".join(parts).encode("utf-8")).hexdigest()[:16]
 
 
 def _judge_fingerprint(question: dict) -> str:
@@ -438,11 +509,133 @@ def _compound_parts(claim: str) -> list[str]:
     return parts
 
 
+_ENUM_PREDICATE_MARKERS = (
+    "一律", "均", "必须", "应当", "不得", "不予", "禁止", "需要", "须", "应",
+)
+_ENUM_ACTION_SYNONYMS = (
+    ("一律退回", "不能受理"),
+    ("不予接收", "不能受理"),
+    ("不予报销", "不能受理"),
+    ("不得报销", "不能受理"),
+    ("不能接收", "不能受理"),
+    ("不能报销", "不能受理"),
+    ("拒收", "不能受理"),
+    ("拒付", "不能受理"),
+    ("不接收", "不能受理"),
+    ("退回", "不能受理"),
+)
+
+
+def _enumeration_parts(claim: str) -> tuple[list[str], str] | None:
+    """拆“定额发票、手撕票一律不予受理”这类顿号列举 + 共享谓语的事实点。"""
+    text = re.sub(r"[（(][^（）()]*[）)]", "", claim)
+    if "、" not in text:
+        return None
+    segments = [part.strip(" 。，,；;") for part in text.split("、") if part.strip()]
+    if len(segments) < 2:
+        return None
+    last = segments[-1]
+    predicate = head = ""
+    for marker in _ENUM_PREDICATE_MARKERS:
+        index = last.find(marker)
+        if index > 0:
+            predicate, head = last[index:], last[:index]
+            break
+    if not predicate or len(head) < 2:
+        return None
+    items = segments[:-1] + [head]
+    if any(len(item) < 2 for item in items):
+        return None
+    return items, predicate
+
+
+def _predicate_norm(text: str) -> str:
+    normalized = _canon(text)
+    for variant, canonical in _ENUM_ACTION_SYNONYMS:
+        normalized = normalized.replace(_canon(variant), _canon(canonical))
+    return normalized
+
+
+def _predicate_present(predicate: str, answer: str) -> bool:
+    expected = _predicate_norm(predicate)
+    actual = _predicate_norm(answer)
+    if expected in actual:
+        return True
+    bigrams = [expected[index : index + 2] for index in range(len(expected) - 1)]
+    if not bigrams:
+        return False
+    need = max(2, -(-len(bigrams) * 50 // 100))
+    return sum(1 for bigram in bigrams if bigram in actual) >= need
+
+
+def _enumeration_recovery(claim: str, model_answer: str) -> str | None:
+    """逐项确认列举项，并单独确认共享谓语；避免要求谓语在每个子句窗口内逐字出现。"""
+    parsed = _enumeration_parts(claim)
+    if not parsed:
+        return None
+    items, predicate = parsed
+    if not _predicate_present(predicate, model_answer):
+        return None
+    sentences = [
+        part.strip(" -*") for part in re.split(r"[。；;\n]", model_answer) if part.strip()
+    ]
+    quotes = []
+    for item in items:
+        item_norm = _canon(item)
+        quote = next(
+            (sentence for sentence in sentences if item_norm in _canon(sentence)),
+            None,
+        )
+        if not quote:
+            return None
+        quotes.append(quote)
+    return "……".join(quotes)
+
+
+_NEGATED_CLAIM = re.compile(r"^(?:不|未|无|没有|非)")
+_REJECTION_MARKERS = (
+    "拒绝", "否决", "反对", "禁止", "不得", "不能", "不予", "没有",
+    "不再", "不支持", "不接收", "不谎称", "驳回", "取消",
+)
+
+
+def _negation_recovery(claim: str, model_answer: str) -> str | None:
+    """否定式事实被改写成“拒绝/否决/不予……”时找回，避免误判 missing。"""
+    if not _NEGATED_CLAIM.match(claim.strip()):
+        return None
+    words = [
+        word for word in _content_words(claim)
+        if word not in {"没有", "不是", "不能", "不得"}
+    ]
+    if len(words) < 2:
+        return None
+    answer_norm = _canon(model_answer)
+    if sum(1 for word in words if _canon(word) in answer_norm) * 10 < len(words) * 6:
+        return None
+    sentences = [
+        part.strip(" -*") for part in re.split(r"[。；;\n]", model_answer) if part.strip()
+    ]
+    candidates = [
+        sentence
+        for sentence in sentences
+        if any(marker in sentence for marker in _REJECTION_MARKERS)
+        and any(_canon(word) in _canon(sentence) for word in words)
+    ]
+    if not candidates:
+        return None
+    return max(
+        candidates,
+        key=lambda sentence: sum(
+            1 for word in words if _canon(word) in _canon(sentence)
+        ),
+    )
+
+
 def _compound_recovery(claim: str, model_answer: str) -> str | None:
     """逐子句找回：全部子句都在回答中有证据才算覆盖，引文用“……”连接。"""
     parts = _compound_parts(claim)
     if not parts:
-        return None
+        return _enumeration_recovery(claim, model_answer)
     quotes = []
     for part in parts:
         quote = _recovery_window(part, model_answer, allow_word_fallback=False)
@@ -481,6 +674,8 @@ def _fact_row(
             recovered = _recovery_window(
                 claim, model_answer, allow_word_fallback=(status == "missing")
             )
+            if not recovered and status == "missing":
+                recovered = _negation_recovery(claim, model_answer)
             if recovered:
                 quote, status = recovered, "covered"
     return {"id": str(item.get("id") or fallback_id), "claim": claim, "status": status, "quote": quote}
@@ -695,10 +890,17 @@ def _parse_judge_json(text: str) -> dict:
     if not match:
         raise ValueError(f"judge returned non-JSON: {text[:200]}")
     raw = match.group(0)
-    try:
-        return json.loads(raw)
-    except json.JSONDecodeError:
-        return json.loads(_escape_inner_quotes(raw))
+    # 模型偶尔把字符串结尾的英文引号写成中文引号（如 `。“}`），先按结构位置修回
+    repaired = re.sub(r"“(\s*[}\]])", r'"\1', raw)
+    candidates = [raw] if repaired == raw else [raw, repaired]
+    last_error: json.JSONDecodeError | None = None
+    for candidate in candidates:
+        for attempt in (candidate, _escape_inner_quotes(candidate)):
+            try:
+                return json.loads(attempt)
+            except json.JSONDecodeError as exc:
+                last_error = exc
+    raise last_error or ValueError("judge returned unparsable JSON")
 
 
 def judge(
@@ -759,6 +961,7 @@ def evaluate(
     output_stem: str | None = None,
     results_name: str | None = None,
     write: bool = True,
+    judge_repeats: int = 1,
 ) -> dict:
     REPORT_DIR.mkdir(parents=True, exist_ok=True)
     source_path = questions_path or QUESTIONS_PATH
@@ -803,14 +1006,19 @@ def evaluate(
             "permission_ok": None, "reason": "", "facts": [],
             "contradictions": [], "unsupported_claims": [], "refused": None,
         }
+        runs: list[dict] = []
         if use_judge:
-            judged = judge(
-                question,
-                answer_text,
-                context=_judge_excerpt(response["hits"]),
-                full_docs=_full_docs_context(answer_text, gold_ids),
-                leaked=bool(leaked_ids or leaked_terms),
-            )
+            runs = [
+                judge(
+                    question,
+                    answer_text,
+                    context=_judge_excerpt(response["hits"]),
+                    full_docs=_full_docs_context(answer_text, gold_ids),
+                    leaked=bool(leaked_ids or leaked_terms),
+                )
+                for _ in range(max(1, judge_repeats))
+            ]
+            judged = _modal_judgement(runs) if len(runs) > 1 else runs[0]
 
         result = {
             "id": question["id"],
@@ -834,20 +1042,37 @@ def evaluate(
             "sql": response.get("sql"),
             "sql_row_count": (response.get("sql_result") or {}).get("row_count"),
             "table_doc_ids": response.get("table_doc_ids", []),
+            "table_calc": response.get("table_calc"),
             "judge": judged,
             "answer_fingerprint": answer_fp,
             "judge_fingerprint": _judge_fingerprint(question),
             "latency_s": round(time.time() - started, 2),
         }
+        if len(runs) > 1:
+            result["judge_repeat_scores"] = [run["score"] for run in runs]
         results.append(result)
+        suffix = (
+            f" repeats={result['judge_repeat_scores']}"
+            if len(runs) > 1
+            else ""
+        )
         print(
             f"  retrieval_hit={result['retrieval_hit']} cites_gold={cites_gold} "
             f"score={judged['score']} faithful={judged['faithful']} "
             f"unsupported={len(judged['unsupported_claims'])} "
-            f"leak={leaked_ids + leaked_terms}"
+            f"leak={leaked_ids + leaked_terms}{suffix}"
         )
 
     report = _aggregate(results, str(source_path))
+    if judge_repeats > 1:
+        report["judge_repeats"] = judge_repeats
+        report["judge_score_agreement"] = (
+            sum(
+                1 for result in results
+                if len(set(result.get("judge_repeat_scores", []))) == 1
+            ) / len(results)
+            if results else None
+        )
     if write:
         stem = output_stem or ("report_partial" if ids else "report")
         name = results_name or ("results_partial.jsonl" if ids else "results.jsonl")
@@ -1034,6 +1259,7 @@ def judge_stability(
     ids: set[str] | None = None,
     limit: int | None = None,
     allow_stale: bool = False,
+    output_stem: str = "report_stability",
 ) -> dict:
     """对同一批已存回答重复判分，量化 judge 的逐题一致性。"""
     if repeats < 2:
@@ -1201,7 +1427,7 @@ def judge_stability(
         ],
         "records": records,
     }
-    _write_stability_outputs(report)
+    _write_stability_outputs(report, output_stem)
     return report
 
 
@@ -1209,9 +1435,9 @@ def _fmt_rate(value: float | None) -> str:
     return f"{value:.3f}" if value is not None else "-"
 
 
-def _write_stability_outputs(report: dict) -> None:
+def _write_stability_outputs(report: dict, stem: str = "report_stability") -> None:
     REPORT_DIR.mkdir(parents=True, exist_ok=True)
-    (REPORT_DIR / "report_stability.json").write_text(
+    (REPORT_DIR / f"{stem}.json").write_text(
         json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8"
     )
     agreement = report["agreement"]
@@ -1296,7 +1522,7 @@ def _write_stability_outputs(report: dict) -> None:
         )
     if not report["unstable_fact_points"]:
         lines.append("| - | - | - |")
-    (REPORT_DIR / "report_stability.md").write_text(
+    (REPORT_DIR / f"{stem}.md").write_text(
         "\n".join(lines) + "\n", encoding="utf-8"
     )
     print(json.dumps(
@@ -1706,7 +1932,17 @@ if __name__ == "__main__":
     parser.add_argument(
         "--questions",
         default=str(QUESTIONS_PATH),
-        help="题目文件（默认 v2）",
+        help="题目文件（默认 v3）",
+    )
+    parser.add_argument(
+        "--report-stem",
+        default=None,
+        help="报告文件名前缀，默认 report（全量）或 report_partial（--ids）",
+    )
+    parser.add_argument(
+        "--results-name",
+        default=None,
+        help="结果文件名，默认 results.jsonl 或 results_partial.jsonl",
     )
     parser.add_argument(
         "--rejudge",
@@ -1753,6 +1989,11 @@ if __name__ == "__main__":
         help="复用已存回答重复判分 N 次，量化 judge 稳定性（默认 3）",
     )
     parser.add_argument(
+        "--stability-stem",
+        default=None,
+        help="稳定性报告前缀，默认 report_stability；--ids 子集默认 report_stability_partial",
+    )
+    parser.add_argument(
         "--drift-sample",
         nargs="?",
         const=12,
@@ -1777,6 +2018,10 @@ if __name__ == "__main__":
             ids,
             args.limit,
             allow_stale=args.allow_stale,
+            output_stem=(
+                args.stability_stem
+                or ("report_stability_partial" if ids else "report_stability")
+            ),
         )
     elif args.rejudge:
         rejudge(
@@ -1792,4 +2037,7 @@ if __name__ == "__main__":
             use_judge=not args.no_judge,
             questions_path=Path(args.questions),
             ids=ids,
+            output_stem=args.report_stem,
+            results_name=args.results_name,
+            judge_repeats=args.judge_repeats,
         )
