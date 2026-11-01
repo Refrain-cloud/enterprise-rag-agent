@@ -906,6 +906,51 @@ def _fact_signature(judged: dict) -> tuple[tuple[str, str], ...]:
     )
 
 
+def _fact_points(
+    runs: list[dict], key_facts: list[str] | None = None
+) -> list[dict]:
+    """逐事实点核对多轮判分状态；无必答点时按规范化 claim 保守对齐。"""
+    facts = [str(item).strip() for item in (key_facts or []) if str(item).strip()]
+    points: list[dict] = []
+    if facts:
+        for index, claim in enumerate(facts, 1):
+            points.append({"id": f"K{index}", "claim": claim, "statuses": []})
+        for run in runs:
+            by_id = {
+                str(fact.get("id", "")): fact
+                for fact in run.get("facts") or []
+            }
+            for point in points:
+                fact = by_id.get(point["id"])
+                point["statuses"].append(
+                    str(fact.get("status", "absent")) if fact else "absent"
+                )
+    else:
+        claims: dict[str, str] = {}
+        for run in runs:
+            for fact in run.get("facts") or []:
+                key = _canon(str(fact.get("claim", "")))
+                if key:
+                    claims.setdefault(key, str(fact.get("claim", "")))
+        for key, claim in claims.items():
+            statuses = []
+            for run in runs:
+                match = next(
+                    (
+                        fact for fact in run.get("facts") or []
+                        if _canon(str(fact.get("claim", ""))) == key
+                    ),
+                    None,
+                )
+                statuses.append(
+                    str(match.get("status", "absent")) if match else "absent"
+                )
+            points.append({"id": "", "claim": claim, "statuses": statuses})
+    for point in points:
+        point["stable"] = len(set(point["statuses"])) == 1
+    return points
+
+
 def _modal_judgement(runs: list[dict]) -> dict:
     """重复判分时取众数：先按分数，再按事实点状态组合，避免单次抖动定分。"""
     valid = [run for run in runs if run.get("score") is not None]
@@ -1009,6 +1054,7 @@ def judge_stability(
         faithfuls = [run["faithful"] for run in runs]
         refusals = [run["refusal_ok"] for run in runs]
         fact_signatures = {_fact_signature(run) for run in runs}
+        fact_points = _fact_points(runs, row.get("key_facts"))
         majority = Counter(scores).most_common(1)[0][0]
         record = {
             "id": row["id"],
@@ -1018,20 +1064,48 @@ def judge_stability(
             "majority_score": majority,
             "score_stable": len(set(scores)) == 1,
             "facts_stable": len(fact_signatures) == 1,
+            "fact_points_stable": all(point["stable"] for point in fact_points),
+            "has_key_facts": bool(row.get("key_facts")),
             "faithful_stable": len(set(faithfuls)) == 1,
             "refusal_stable": len(set(refusals)) == 1,
+            "fact_points": fact_points,
             "repeat_reasons": [run["reason"] for run in runs],
             "runs": runs,
         }
         records.append(record)
         print(
             f"[{index}/{len(rows)}] {row['id']} stored={record['stored_score']} "
-            f"repeats={scores} facts_stable={record['facts_stable']}",
+            f"repeats={scores} facts_stable={record['facts_stable']} "
+            f"fact_points_stable={record['fact_points_stable']}",
             flush=True,
         )
 
     def _rate(key: str) -> float | None:
         return sum(1 for record in records if record[key]) / len(records) if records else None
+
+    all_points = [
+        (record["id"], point)
+        for record in records
+        for point in record["fact_points"]
+    ]
+    stable_points = sum(1 for _, point in all_points if point["stable"])
+    fact_point_agreement = stable_points / len(all_points) if all_points else None
+
+    def _point_agreement(subset: list[dict]) -> dict:
+        points = [point for record in subset for point in record["fact_points"]]
+        stable = sum(1 for point in points if point["stable"])
+        return {
+            "questions": len(subset),
+            "stable": stable,
+            "total": len(points),
+            "rate": stable / len(points) if points else None,
+        }
+
+    score_stable_facts_unstable = [
+        record["id"]
+        for record in records
+        if record["score_stable"] and not record["fact_points_stable"]
+    ]
 
     run_metrics = [
         _run_metrics([record["runs"][run_index] for record in records])
@@ -1064,6 +1138,7 @@ def judge_stability(
         "agreement": {
             "score": _rate("score_stable"),
             "facts": _rate("facts_stable"),
+            "fact_points": fact_point_agreement,
             "faithful": _rate("faithful_stable"),
             "refusal": _rate("refusal_stable"),
             "all": (
@@ -1077,6 +1152,29 @@ def judge_stability(
                 if records else None
             ),
         },
+        "fact_point_counts": {
+            "stable": stable_points,
+            "total": len(all_points),
+        },
+        "fact_point_by_type": {
+            "with_key_facts": _point_agreement(
+                [record for record in records if record["has_key_facts"]]
+            ),
+            "auto_split": _point_agreement(
+                [record for record in records if not record["has_key_facts"]]
+            ),
+        },
+        "score_stable_facts_unstable": score_stable_facts_unstable,
+        "unstable_fact_points": [
+            {
+                "id": record_id,
+                "fact_id": point["id"],
+                "claim": point["claim"],
+                "statuses": point["statuses"],
+            }
+            for record_id, point in all_points
+            if not point["stable"]
+        ],
         "run_metrics": run_metrics,
         "majority_metrics": majority_metrics,
         "stored_metrics": _run_metrics(
@@ -1124,7 +1222,15 @@ def _write_stability_outputs(report: dict) -> None:
         f"- 结果文件：{report['results_file']}",
         f"- 题数：{report['question_count']}，每题重复判分：{report['repeats']} 次",
         f"- 分数完全一致：{_fmt_rate(agreement['score'])}",
-        f"- 事实点状态完全一致：{_fmt_rate(agreement['facts'])}",
+        f"- 整题事实点签名完全一致：{_fmt_rate(agreement['facts'])}",
+        f"- 逐事实点状态一致率：{_fmt_rate(agreement['fact_points'])}"
+        f"（{report['fact_point_counts']['stable']}/{report['fact_point_counts']['total']}）",
+        f"- 逐事实点一致率（有必答点）：{_fmt_rate(report['fact_point_by_type']['with_key_facts']['rate'])}"
+        f"（{report['fact_point_by_type']['with_key_facts']['stable']}/"
+        f"{report['fact_point_by_type']['with_key_facts']['total']}）",
+        f"- 逐事实点一致率（judge 自拆点）：{_fmt_rate(report['fact_point_by_type']['auto_split']['rate'])}"
+        f"（{report['fact_point_by_type']['auto_split']['stable']}/"
+        f"{report['fact_point_by_type']['auto_split']['total']}，措辞差异保守计入不一致）",
         f"- 忠实判定完全一致：{_fmt_rate(agreement['faithful'])}",
         f"- 拒答判定完全一致：{_fmt_rate(agreement['refusal'])}",
         f"- 四项全部一致：{_fmt_rate(agreement['all'])}",
@@ -1173,6 +1279,23 @@ def _write_stability_outputs(report: dict) -> None:
         )
     if not report["unstable"]:
         lines.append("| - | - | - | - | - | - | - | - |")
+    lines.extend([
+        "",
+        "## 分数稳定但事实点归因不一致",
+        "",
+        f"- 题目：{', '.join(report['score_stable_facts_unstable']) or '无'}",
+        "",
+        "## 事实点级不一致",
+        "",
+        "| 题目 | 事实点 | 各轮状态 |",
+        "|---|---|---|",
+    ])
+    for point in report["unstable_fact_points"]:
+        lines.append(
+            f"| {point['id']} | {point['claim']} | {' / '.join(point['statuses'])} |"
+        )
+    if not report["unstable_fact_points"]:
+        lines.append("| - | - | - |")
     (REPORT_DIR / "report_stability.md").write_text(
         "\n".join(lines) + "\n", encoding="utf-8"
     )
