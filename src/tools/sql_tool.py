@@ -18,7 +18,17 @@ from src.config import (
     get_client,
 )
 from src.security.policy import can_access
-from src.tools.table_loader import LoadedTables, build_loaded_tables, select_records
+from src.tools.table_loader import (
+    LoadedTables,
+    build_loaded_tables,
+    load_corpus,
+    select_records,
+)
+from src.tools.text_table import (
+    TEXT_TABLE_FORMATS,
+    compose_scanned_answer,
+    compute_scanned_aggregate,
+)
 
 ALLOWED_ACTIONS = {
     sqlite3.SQLITE_SELECT,
@@ -323,6 +333,40 @@ def _used_doc_ids(sql: str, answer: str, loaded: LoadedTables) -> list[str]:
             referenced.append(doc_id)
     ordered = list(dict.fromkeys(referenced))
     return ordered or list(dict.fromkeys(table.doc_id for table in loaded.tables))
+
+
+def answer_with_scanned_tables(
+    question: str, role: str, hits: list[dict]
+) -> dict | None:
+    """扫描件 OCR 文本里的表格走确定性核算，避免模型自行心算加总。"""
+    if not TABLE_TOOL_ENABLED or not is_aggregation_question(question):
+        return None
+    corpus = load_corpus()
+    seen: set[str] = set()
+    for hit in hits:
+        meta = hit["metadata"]
+        doc_id = meta.get("doc_id", "")
+        if not doc_id or doc_id in seen:
+            continue
+        seen.add(doc_id)
+        record = corpus.get(doc_id) or {}
+        document_format = record.get("format") or meta.get("format")
+        if document_format not in TEXT_TABLE_FORMATS:
+            continue
+        if not can_access(role, meta):
+            continue
+        calculation = compute_scanned_aggregate(
+            doc_id, meta.get("title", ""), record.get("text", ""), question
+        )
+        if not calculation:
+            continue
+        return {
+            "answer": compose_scanned_answer(calculation),
+            "route": "table",
+            "table_doc_ids": [doc_id],
+            "table_calc": calculation,
+        }
+    return None
 
 
 def answer_with_tables(question: str, role: str, hits: list[dict]) -> dict | None:

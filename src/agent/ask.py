@@ -15,7 +15,12 @@ from src.config import (
 )
 from src.retrieval.search import hybrid_search
 from src.security.policy import can_access, normalize_role
-from src.tools.sql_tool import answer_with_tables, eligible_table_hits, is_aggregation_question
+from src.tools.sql_tool import (
+    answer_with_scanned_tables,
+    answer_with_tables,
+    eligible_table_hits,
+    is_aggregation_question,
+)
 
 SYSTEM_PROMPT = """你是北辰智造科技的内部知识库助手。请严格依据提供的资料回答。
 
@@ -139,6 +144,8 @@ def answer(question: str, role: str = "普通员工", top_k: int = TOP_K) -> dic
 
     if TABLE_TOOL_ENABLED:
         tool_result = answer_with_tables(question, role, hits)
+        if not tool_result:
+            tool_result = answer_with_scanned_tables(question, role, hits)
         if tool_result:
             used_doc_ids = set(tool_result.get("table_doc_ids", []))
             tool_result["hits"] = hits
