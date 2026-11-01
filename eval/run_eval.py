@@ -163,6 +163,7 @@ STRICT_REFUSAL_MARKERS = [
 ABSENCE_REFUSAL_MARKERS = [
     "不存在", "未提及", "已终止", "没有下一阶段", "无下一阶段",
     "没有相关信息", "无相关信息",
+    "未最终确定", "尚未确定", "未确定是否", "尚未最终确定",
 ]
 
 JUDGE_PROMPT = """你是 RAG 评估中的事实提取员，只做核对，不评分，不写分析。
@@ -1154,10 +1155,13 @@ def evaluate(
         if response.get("format_check"):
             check = response["format_check"]
             if check.get("violations"):
-                suffix += (
-                    f" fmt_retry={check['violations']}"
-                    f"->{'fixed' if not check.get('remaining') else check.get('remaining')}"
-                )
+                if check.get("retry_enabled"):
+                    suffix += (
+                        f" fmt_retry={check['violations']}"
+                        f"->{'fixed' if not check.get('remaining') else check.get('remaining')}"
+                    )
+                else:
+                    suffix += f" fmt_violation={check['violations']}"
         print(
             f"  retrieval_hit={result['retrieval_hit']} cites_gold={cites_gold} "
             f"score={judged['score']} faithful={judged['faithful']} "
@@ -2000,15 +2004,29 @@ def _write_markdown(report: dict, path: Path) -> None:
         ),
         *(
             [
-                f"- 生成 token：{cost['generation']['total_tokens']}（{cost['generation']['calls']} 次调用，"
-                f"约 {cost['generation']['cost_cny']:.4f} 元）",
-                f"- judge token：{cost['judge']['total_tokens']}（{cost['judge']['calls']} 次调用，"
+                *(
+                    [
+                        f"- 生成 token：{cost['generation']['total_tokens']}"
+                        f"（{cost['generation']['calls']} 次调用，"
+                        f"约 {cost['generation']['cost_cny']:.4f} 元）",
+                    ]
+                    if cost.get("generation")
+                    else []
+                ),
+                f"- judge token：{cost['judge']['total_tokens']}"
+                f"（{cost['judge']['calls']} 次调用，"
                 f"约 {cost['judge']['cost_cny']:.4f} 元）",
                 f"- 预估总费用：约 {cost['total']['cost_cny']:.4f} 元"
                 f"（均摊 {cost['per_question']['avg_total_cost_cny']:.6f} 元/题）",
-                f"- 平均延迟：{_fmt_float(cost['per_question']['avg_latency_s'])} s"
-                f"（检索 {_fmt_float(cost['per_question']['avg_retrieval_latency_s'])} s，"
-                f"rerank {_fmt_float(cost['per_question']['avg_rerank_latency_s'])} s/题）",
+                *(
+                    [
+                        f"- 平均延迟：{_fmt_float(cost['per_question']['avg_latency_s'])} s"
+                        f"（检索 {_fmt_float(cost['per_question']['avg_retrieval_latency_s'])} s，"
+                        f"rerank {_fmt_float(cost['per_question']['avg_rerank_latency_s'])} s/题）",
+                    ]
+                    if "avg_latency_s" in cost["per_question"]
+                    else []
+                ),
             ]
             if (cost := report.get("cost"))
             else []
