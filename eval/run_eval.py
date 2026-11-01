@@ -1014,7 +1014,10 @@ def evaluate(
     answer_fp = _answer_fingerprint()
     results: list[dict] = []
     for index, question in enumerate(questions, 1):
-        print(f"[{index}/{len(questions)}] {question['id']} {question['question']}")
+        print(
+            f"[{index}/{len(questions)}] {question['id']} {question['question']}",
+            flush=True,
+        )
         started = time.time()
         repeat_count = max(1, gen_repeats)
         responses: list[dict] = []
@@ -1159,7 +1162,8 @@ def evaluate(
             f"  retrieval_hit={result['retrieval_hit']} cites_gold={cites_gold} "
             f"score={judged['score']} faithful={judged['faithful']} "
             f"unsupported={len(judged['unsupported_claims'])} "
-            f"leak={leaked_ids + leaked_terms}{suffix}"
+            f"leak={leaked_ids + leaked_terms}{suffix}",
+            flush=True,
         )
 
     report = _aggregate(results, str(source_path))
