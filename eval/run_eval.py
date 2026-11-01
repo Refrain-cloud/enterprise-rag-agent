@@ -1843,6 +1843,10 @@ def _aggregate(results: list[dict], source: str) -> dict:
         checks = [row["format_check"] for row in format_rows]
         format_check = {
             "questions": len(checks),
+            "retry_enabled": any(item.get("retry_enabled") for item in checks),
+            "violation_questions": sum(
+                1 for item in checks if item.get("violations")
+            ),
             "retried": sum(1 for item in checks if item.get("retried")),
             "retry_rate": sum(1 for item in checks if item.get("retried")) / len(checks),
             "fixed": sum(
@@ -1986,9 +1990,10 @@ def _write_markdown(report: dict, path: Path) -> None:
         ),
         *(
             [
-                f"- 结构化格式：重试 {fmt['retried']}/{fmt['questions']} 题"
-                f"（{fmt['retry_rate']:.3f}），修复 {fmt['fixed']}，"
-                f"仍有违规 {fmt['remaining_violations']}，字段：{fmt['labels']}",
+                f"- 结构化格式：违规 {fmt['violation_questions']}/{fmt['questions']} 题，"
+                f"重写 {'开' if fmt['retry_enabled'] else '关'}"
+                f"（重写 {fmt['retried']} 题，修复 {fmt['fixed']}，"
+                f"仍有违规 {fmt['remaining_violations']}），字段：{fmt['labels']}",
             ]
             if (fmt := metrics.get("format_check"))
             else []

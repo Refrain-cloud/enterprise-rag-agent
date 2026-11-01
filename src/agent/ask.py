@@ -10,6 +10,7 @@ from src.config import (
     CHAT_MODEL,
     GENERATION_SEED,
     ROLES,
+    STRUCTURED_FIELD_RETRY,
     TABLE_TOOL_ENABLED,
     TOP_K,
 )
@@ -244,11 +245,12 @@ def answer(question: str, role: str = "普通员工", top_k: int = TOP_K) -> dic
     violations = _structured_field_violations(text, hits)
     format_check = {
         "violations": violations,
+        "retry_enabled": STRUCTURED_FIELD_RETRY,
         "retried": False,
         "remaining": [],
         "literal_prefix_stripped": literal_prefix_stripped,
     }
-    if violations:
+    if violations and STRUCTURED_FIELD_RETRY:
         correction = (
             "上一版回答缺少以下字段名或把字段与其它内容合并："
             f"{'、'.join(violations)}。请保留原有事实与引用，按“字段名：取值”逐行重写，"

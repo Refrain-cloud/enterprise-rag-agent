@@ -41,6 +41,8 @@ RERANK_BASE_URL = os.getenv(
 
 ROLES = ("普通员工", "HR", "财务", "销售", "IT", "产品", "管理层")
 
+# 结构化字段重写默认关闭：v5 全量验证显示重写会把多跳题改写成无关表单字段
+STRUCTURED_FIELD_RETRY = os.getenv("RAG_FIELD_RETRY", "0") not in {"0", "false", "False"}
 TABLE_TOOL_ENABLED = os.getenv("RAG_TABLE_TOOL", "1") not in {"0", "false", "False"}
 TABLE_FORMATS = {"csv", "xlsx"}
 AGG_KEYWORDS = (
