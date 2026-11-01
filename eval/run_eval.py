@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import difflib
 import hashlib
 import inspect
 import json
@@ -957,6 +958,40 @@ def judge(
     }
 
 
+def _generation_stability(responses: list[dict], sample_scores: list) -> dict:
+    answers = [response["answer"] for response in responses]
+    normalized = [_norm(value) for value in answers]
+    similarities = [
+        difflib.SequenceMatcher(None, normalized[0], value).ratio()
+        for value in normalized[1:]
+    ]
+    retrieved = [
+        [hit["metadata"]["doc_id"] for hit in response["hits"]]
+        for response in responses
+    ]
+    scores = [score for score in sample_scores if score is not None]
+    return {
+        "repeats": len(responses),
+        "exact_match": all(value == answers[0] for value in answers),
+        "normalized_match": all(value == normalized[0] for value in normalized),
+        # 归一化后的字符相似度，重复次数为 1 时记 1.0
+        "mean_similarity": round(
+            sum(similarities) / len(similarities) if similarities else 1.0, 4
+        ),
+        "retrieval_stable": all(value == retrieved[0] for value in retrieved),
+        "route_stable": all(
+            response.get("route", "rag") == responses[0].get("route", "rag")
+            for response in responses
+        ),
+        "denied_stable": all(
+            bool(response.get("denied")) == bool(responses[0].get("denied"))
+            for response in responses
+        ),
+        "sample_scores": sample_scores,
+        "score_stable": (len(set(scores)) == 1) if len(scores) > 1 else None,
+    }
+
+
 def evaluate(
     limit: int | None,
     use_judge: bool,
@@ -966,6 +1001,7 @@ def evaluate(
     results_name: str | None = None,
     write: bool = True,
     judge_repeats: int = 1,
+    gen_repeats: int = 1,
 ) -> dict:
     REPORT_DIR.mkdir(parents=True, exist_ok=True)
     source_path = questions_path or QUESTIONS_PATH
@@ -980,20 +1016,36 @@ def evaluate(
     for index, question in enumerate(questions, 1):
         print(f"[{index}/{len(questions)}] {question['id']} {question['question']}")
         started = time.time()
-        reset_usage()
-        reset_search_stats()
-        try:
-            response = answer(question["question"], role=question["role"])
-        except Exception as exc:
-            response = {
-                "answer": f"ERROR: {exc}",
-                "sources": [],
-                "hits": [],
-                "denied": False,
-                "route": "error",
-            }
-        generation_usage = usage_snapshot()
-        retrieval_stats = search_stats()
+        repeat_count = max(1, gen_repeats)
+        responses: list[dict] = []
+        generation_parts: list[dict] = []
+        retrieval_calls_total = 0
+        retrieval_latency_total = 0.0
+        for _ in range(repeat_count):
+            reset_usage()
+            reset_search_stats()
+            try:
+                attempt = answer(question["question"], role=question["role"])
+            except Exception as exc:
+                attempt = {
+                    "answer": f"ERROR: {exc}",
+                    "sources": [],
+                    "hits": [],
+                    "denied": False,
+                    "route": "error",
+                }
+            generation_parts.append(usage_snapshot())
+            stats = search_stats()
+            retrieval_calls_total += stats["calls"]
+            retrieval_latency_total += stats["elapsed_s"]
+            responses.append(attempt)
+        response = responses[0]
+        generation_usage = merge_usage(*generation_parts)
+        # 生成重复时，检索调用与耗时按全部重复累加，便于换算单次成本
+        retrieval_stats = {
+            "calls": retrieval_calls_total,
+            "elapsed_s": round(retrieval_latency_total, 4),
+        }
 
         retrieved_ids = [hit["metadata"]["doc_id"] for hit in response["hits"]]
         gold_ids = question.get("gold_doc_ids", [])
@@ -1015,6 +1067,7 @@ def evaluate(
             "contradictions": [], "unsupported_claims": [], "refused": None,
         }
         runs: list[dict] = []
+        sample_scores: list = []
         reset_usage()
         if use_judge:
             runs = [
@@ -1028,7 +1081,23 @@ def evaluate(
                 for _ in range(max(1, judge_repeats))
             ]
             judged = _modal_judgement(runs) if len(runs) > 1 else runs[0]
+            sample_scores.append(judged["score"])
+            # 其余生成样本各判一次，用于量化“生成→分数”的漂移
+            for extra in responses[1:]:
+                extra_answer = extra["answer"]
+                extra_judged = judge(
+                    question,
+                    extra_answer,
+                    context=_judge_excerpt(extra["hits"]),
+                    full_docs=_full_docs_context(extra_answer, gold_ids),
+                    leaked=bool(
+                        leaked_ids
+                        or [term for term in forbidden_terms if term in extra_answer]
+                    ),
+                )
+                sample_scores.append(extra_judged["score"])
         judge_usage = usage_snapshot()
+        stability = _generation_stability(responses, sample_scores)
 
         result = {
             "id": question["id"],
@@ -1061,7 +1130,11 @@ def evaluate(
             "retrieval_latency_s": retrieval_stats["elapsed_s"],
             "generation_usage": generation_usage,
             "judge_usage": judge_usage,
+            "generation_stability": stability,
+            "format_check": response.get("format_check"),
         }
+        if repeat_count > 1:
+            result["generation_answers"] = [item["answer"] for item in responses]
         if len(runs) > 1:
             result["judge_repeat_scores"] = [run["score"] for run in runs]
         results.append(result)
@@ -1070,6 +1143,18 @@ def evaluate(
             if len(runs) > 1
             else ""
         )
+        if repeat_count > 1:
+            suffix += (
+                f" gen_score={stability['sample_scores']}"
+                f" gen_similarity={stability['mean_similarity']}"
+            )
+        if response.get("format_check"):
+            check = response["format_check"]
+            if check.get("violations"):
+                suffix += (
+                    f" fmt_retry={check['violations']}"
+                    f"->{'fixed' if not check.get('remaining') else check.get('remaining')}"
+                )
         print(
             f"  retrieval_hit={result['retrieval_hit']} cites_gold={cites_gold} "
             f"score={judged['score']} faithful={judged['faithful']} "
@@ -1706,6 +1791,74 @@ def _aggregate(results: list[dict], source: str) -> dict:
         len(r["judge"].get("unsupported_claims") or []) for r in judged_results
     )
 
+    gen_rows = [
+        r for r in results
+        if r.get("generation_stability")
+        and r["generation_stability"].get("repeats", 1) > 1
+    ]
+    generation_stability = None
+    if gen_rows:
+        stability = [row["generation_stability"] for row in gen_rows]
+        scored = [item for item in stability if item.get("score_stable") is not None]
+        generation_stability = {
+            "repeats": max(item["repeats"] for item in stability),
+            "questions": len(stability),
+            "exact_match_rate": sum(1 for item in stability if item["exact_match"])
+            / len(stability),
+            "normalized_match_rate": sum(
+                1 for item in stability if item["normalized_match"]
+            ) / len(stability),
+            "mean_similarity": round(
+                sum(item["mean_similarity"] for item in stability) / len(stability), 4
+            ),
+            "retrieval_stable_rate": sum(
+                1 for item in stability if item["retrieval_stable"]
+            ) / len(stability),
+            "route_stable_rate": sum(
+                1 for item in stability if item["route_stable"]
+            ) / len(stability),
+            "score_stable_rate": (
+                sum(1 for item in scored if item["score_stable"]) / len(scored)
+                if scored else None
+            ),
+            "drifted_questions": [
+                row["id"]
+                for row, item in zip(gen_rows, stability)
+                if not item["normalized_match"]
+            ],
+            "score_drifted_questions": [
+                row["id"]
+                for row, item in zip(gen_rows, stability)
+                if item.get("score_stable") is False
+            ],
+        }
+
+    format_rows = [r for r in results if r.get("format_check")]
+    format_check = None
+    if format_rows:
+        checks = [row["format_check"] for row in format_rows]
+        format_check = {
+            "questions": len(checks),
+            "retried": sum(1 for item in checks if item.get("retried")),
+            "retry_rate": sum(1 for item in checks if item.get("retried")) / len(checks),
+            "fixed": sum(
+                1 for item in checks
+                if item.get("retried") and not item.get("remaining")
+            ),
+            "remaining_violations": sum(
+                1 for item in checks if item.get("remaining")
+            ),
+            "labels": dict(
+                sorted(
+                    Counter(
+                        label
+                        for item in checks
+                        for label in item.get("violations") or []
+                    ).items()
+                )
+            ),
+        }
+
     by_category: dict[str, list[dict]] = defaultdict(list)
     for result in results:
         by_category[result["category"]].append(result)
@@ -1766,6 +1919,8 @@ def _aggregate(results: list[dict], source: str) -> dict:
             "permission_leaks": len(permission_leaks),
             "score_distribution": dict(sorted(Counter(r["judge"]["score"] for r in judged_results).items())),
             "route_counts": dict(sorted(Counter(result["route"] for result in results).items())),
+            "generation_stability": generation_stability,
+            "format_check": format_check,
         },
         "by_category": category_metrics,
         "cost": _cost_summary(results),
@@ -1811,6 +1966,29 @@ def _write_markdown(report: dict, path: Path) -> None:
         f"- 权限合规率：{metrics['permission_ok_rate']}",
         f"- 权限泄漏数：{metrics['permission_leaks']}",
         f"- 路由分布：{metrics['route_counts']}",
+        *(
+            [
+                f"- 生成重复：{gen['repeats']} 次/题；归一化完全一致 "
+                f"{gen['normalized_match_rate']:.3f}，逐字一致 {gen['exact_match_rate']:.3f}，"
+                f"平均相似度 {gen['mean_similarity']:.3f}",
+                f"- 生成漂移：检索稳定 {gen['retrieval_stable_rate']:.3f}，"
+                f"路由稳定 {gen['route_stable_rate']:.3f}，"
+                f"分数稳定 {_fmt_float(gen.get('score_stable_rate'))}",
+                f"- 措辞漂移题：{', '.join(gen['drifted_questions']) or '-'}",
+                f"- 分数漂移题：{', '.join(gen['score_drifted_questions']) or '-'}",
+            ]
+            if (gen := metrics.get("generation_stability"))
+            else []
+        ),
+        *(
+            [
+                f"- 结构化格式：重试 {fmt['retried']}/{fmt['questions']} 题"
+                f"（{fmt['retry_rate']:.3f}），修复 {fmt['fixed']}，"
+                f"仍有违规 {fmt['remaining_violations']}，字段：{fmt['labels']}",
+            ]
+            if (fmt := metrics.get("format_check"))
+            else []
+        ),
         *(
             [
                 f"- 生成 token：{cost['generation']['total_tokens']}（{cost['generation']['calls']} 次调用，"
@@ -2101,6 +2279,12 @@ if __name__ == "__main__":
         help="每题重复判分次数，取众数写入基线（建议 3；默认 1）",
     )
     parser.add_argument(
+        "--gen-repeats",
+        type=int,
+        default=1,
+        help="每题重复生成次数，用于统计生成漂移（默认 1；建议 3）",
+    )
+    parser.add_argument(
         "--merge-partial",
         action="store_true",
         help="把 --partial 中 --ids 指定的题号显式并入 --results 基线",
@@ -2170,4 +2354,5 @@ if __name__ == "__main__":
             output_stem=args.report_stem,
             results_name=args.results_name,
             judge_repeats=args.judge_repeats,
+            gen_repeats=args.gen_repeats,
         )
