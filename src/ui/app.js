@@ -1,4 +1,6 @@
 const CITE_RE = /\[([A-Z]{2,}-\d+[A-Z]?)\]/g;
+const SESSION_KEY = "rag_session_id";
+const TRANSCRIPT_KEY = "rag_transcript";
 
 const EXAMPLES = [
   "员工满 3 年不满 5 年，年休假有几天？",
@@ -7,7 +9,57 @@ const EXAMPLES = [
   "发票丢了还能报销吗？需要哪些材料？",
 ];
 
+const STATUS_TEXT = {
+  "prepare:start": "正在理解问题…",
+  "retrieve:start": "正在检索资料…",
+  "retrieve:done": "检索完成，正在判断路由…",
+  "guard:done": "正在检查权限…",
+  "route:done": "正在选择回答方式…",
+  "structured:done": "表格核算完成…",
+  "generate:start": "正在生成回答…",
+};
+
 const $ = (id) => document.getElementById(id);
+
+let sessionId = readSession();
+let turns = readTranscript();
+let streamText = "";
+let streamRenderQueued = false;
+
+function readSession() {
+  try {
+    return localStorage.getItem(SESSION_KEY) || "";
+  } catch {
+    return "";
+  }
+}
+
+function readTranscript() {
+  try {
+    const raw = JSON.parse(localStorage.getItem(TRANSCRIPT_KEY) || "[]");
+    return Array.isArray(raw) ? raw.filter((item) => item && item.question) : [];
+  } catch {
+    return [];
+  }
+}
+
+function persistSession(id) {
+  sessionId = id || "";
+  try {
+    if (sessionId) localStorage.setItem(SESSION_KEY, sessionId);
+    else localStorage.removeItem(SESSION_KEY);
+  } catch {
+    // 隐私模式下 localStorage 不可用，会话仍可在当前页面内工作
+  }
+}
+
+function saveTranscript() {
+  try {
+    localStorage.setItem(TRANSCRIPT_KEY, JSON.stringify(turns.slice(-20)));
+  } catch {
+    // ignore
+  }
+}
 
 function escapeHtml(value) {
   return String(value ?? "").replace(/[&<>"']/g, (ch) => ({
@@ -28,7 +80,7 @@ function setStatus(message, kind = "") {
 function setLoading(loading) {
   const button = $("submit");
   button.disabled = loading;
-  button.textContent = loading ? "检索中…" : "提问";
+  button.textContent = loading ? "生成中…" : "提问";
 }
 
 async function loadRoles() {
@@ -74,6 +126,35 @@ function renderAnswer(text) {
     .split(/\n{2,}/)
     .map((block) => `<p>${block.replace(/\n/g, "<br>")}</p>`)
     .join("");
+}
+
+function scheduleStreamRender() {
+  if (streamRenderQueued) return;
+  streamRenderQueued = true;
+  window.requestAnimationFrame(() => {
+    streamRenderQueued = false;
+    if ($("result").classList.contains("hidden")) showStreaming();
+    const answer = $("answer");
+    // final 已渲染后，残留的帧不能再覆盖成原始流式文本
+    if (!answer.classList.contains("streaming")) return;
+    answer.textContent = streamText;
+  });
+}
+
+function showStreaming() {
+  $("result").classList.remove("hidden");
+  $("denied").classList.add("hidden");
+  $("sources").innerHTML = "";
+  $("debug-panel").classList.add("hidden");
+  $("latency").textContent = "";
+  $("usage").textContent = "";
+  $("request-id").textContent = "";
+  const badge = $("route-badge");
+  badge.textContent = "生成中";
+  badge.className = "badge route-rag";
+  const answer = $("answer");
+  answer.classList.add("streaming");
+  answer.textContent = "";
 }
 
 function statusClass(status) {
@@ -125,7 +206,8 @@ function formatUsage(usage) {
   if (!usage || !usage.calls) return "";
   const tokens = usage.total_tokens || 0;
   const cost = Number(usage.cost_cny || 0).toFixed(4);
-  return `${usage.calls} 次模型调用 · ${tokens} tokens · ¥${cost}`;
+  const estimated = usage.estimated_calls ? "（含估算）" : "";
+  return `${usage.calls} 次模型调用 · ${tokens} tokens · ¥${cost}${estimated}`;
 }
 
 function renderTrace(events) {
@@ -157,9 +239,28 @@ function renderTrace(events) {
   }
 }
 
+function updateSessionLine(session) {
+  const el = $("session-info");
+  if (!session) {
+    el.textContent = sessionId ? "会话进行中" : "新会话";
+    return;
+  }
+  const parts = [];
+  if (session.turn != null) parts.push(`第 ${session.turn} 轮`);
+  if (session.turn_count != null) parts.push(`已完成 ${session.turn_count} 轮`);
+  if (session.remaining_turns != null) parts.push(`剩余 ${session.remaining_turns} 轮`);
+  if (session.total_tokens) parts.push(`${session.total_tokens} tokens`);
+  if (session.total_cost_cny != null) {
+    parts.push(`¥${Number(session.total_cost_cny).toFixed(4)}`);
+  }
+  el.textContent = parts.length ? parts.join(" · ") : "会话进行中";
+}
+
 function renderResult(data) {
   $("result").classList.remove("hidden");
-  $("answer").innerHTML = renderAnswer(data.answer);
+  const answer = $("answer");
+  answer.classList.remove("streaming");
+  answer.innerHTML = renderAnswer(data.answer);
   $("denied").classList.toggle("hidden", !data.denied);
   $("sources").classList.remove("hidden");
   renderSources(data.sources || []);
@@ -170,6 +271,7 @@ function renderResult(data) {
   $("latency").textContent = `${data.latency_ms} ms`;
   $("usage").textContent = formatUsage(data.usage);
   $("request-id").textContent = `request ${data.request_id}`;
+  updateSessionLine(data.session || null);
 
   const debugPanel = $("debug-panel");
   const hasDebug = Boolean(data.trace && data.trace.length);
@@ -181,6 +283,46 @@ function renderResult(data) {
   setStatus("");
 }
 
+function summarize(text, limit = 140) {
+  const value = String(text ?? "").replace(/\s+/g, " ").trim();
+  return value.length > limit ? `${value.slice(0, limit)}…` : value;
+}
+
+function renderTranscript() {
+  const panel = $("transcript");
+  panel.classList.toggle("hidden", turns.length === 0);
+  const list = $("turns");
+  list.innerHTML = "";
+  for (const turn of turns) {
+    const item = document.createElement("li");
+    const question = document.createElement("p");
+    question.className = "turn-q";
+    question.textContent = `Q：${turn.question}`;
+    const answer = document.createElement("p");
+    answer.className = "turn-a";
+    answer.textContent = `A：${summarize(turn.answer)}`;
+    item.append(question, answer);
+    list.appendChild(item);
+  }
+}
+
+function addTurn(question, answer) {
+  turns.push({ question, answer: summarize(answer, 400) });
+  turns = turns.slice(-20);
+  saveTranscript();
+  renderTranscript();
+}
+
+function clearSession(message) {
+  persistSession("");
+  turns = [];
+  saveTranscript();
+  renderTranscript();
+  updateSessionLine(null);
+  $("result").classList.add("hidden");
+  setStatus(message || "");
+}
+
 function errorMessage(data, status) {
   if (data && data.message) return data.message;
   if (data && typeof data.detail === "string") return data.detail;
@@ -190,29 +332,125 @@ function errorMessage(data, status) {
   return `请求失败（HTTP ${status}）`;
 }
 
-async function ask() {
+function statusMessage(data) {
+  if (data.node === "guard" && data.status === "denied") {
+    return "该问题涉及越权内容，正在整理拒答…";
+  }
+  if (data.node === "guard" && data.status === "not_found") {
+    return "未找到可访问资料…";
+  }
+  if (data.node === "structured" && data.status === "fallback") {
+    return "结构化工具未命中，转文本回答…";
+  }
+  return STATUS_TEXT[`${data.node}:${data.phase}`] || "";
+}
+
+function dispatchFrame(frame, onEvent) {
+  let event = "message";
+  const dataLines = [];
+  for (const line of frame.split("\n")) {
+    if (!line || line.startsWith(":")) continue;
+    if (line.startsWith("event:")) event = line.slice(6).trim();
+    else if (line.startsWith("data:")) dataLines.push(line.slice(5).trimStart());
+  }
+  if (!dataLines.length) return;
+  let data;
+  try {
+    data = JSON.parse(dataLines.join("\n"));
+  } catch {
+    return;
+  }
+  onEvent(event, data);
+}
+
+async function readEvents(response, onEvent) {
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder("utf-8");
+  let buffer = "";
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    buffer = buffer.replace(/\r\n/g, "\n");
+    let index;
+    while ((index = buffer.indexOf("\n\n")) !== -1) {
+      const frame = buffer.slice(0, index);
+      buffer = buffer.slice(index + 2);
+      dispatchFrame(frame, onEvent);
+    }
+  }
+  buffer += decoder.decode();
+  if (buffer.trim()) dispatchFrame(buffer.replace(/\r\n/g, "\n"), onEvent);
+}
+
+async function ask(allowRetry = true) {
   const question = $("question").value.trim();
   if (!question) {
     setStatus("请输入问题后再提交", "error");
     $("question").focus();
     return;
   }
+  const sentSession = sessionId;
   setLoading(true);
   setStatus("正在检索并生成回答…");
   $("result").classList.add("hidden");
+  streamText = "";
   try {
-    const response = await fetch("/api/ask", {
+    const payload = {
+      question,
+      role: $("role").value,
+      debug: $("debug").checked,
+    };
+    if (sentSession) payload.session_id = sentSession;
+    const response = await fetch("/api/ask/stream", {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        question,
-        role: $("role").value,
-        debug: $("debug").checked,
-      }),
+      headers: {
+        "Content-Type": "application/json",
+        Accept: "text/event-stream",
+      },
+      body: JSON.stringify(payload),
     });
-    const data = await response.json().catch(() => ({}));
-    if (!response.ok) throw new Error(errorMessage(data, response.status));
-    renderResult(data);
+    if (!response.ok) {
+      const data = await response.json().catch(() => ({}));
+      if ([404, 409].includes(response.status) && sentSession && allowRetry) {
+        clearSession("会话已失效或角色不一致，已自动开始新会话");
+        return await ask(false);
+      }
+      throw new Error(errorMessage(data, response.status));
+    }
+
+    let finalData = null;
+    let streamError = null;
+    await readEvents(response, (event, data) => {
+      if (event === "meta") {
+        persistSession(data.session_id);
+        updateSessionLine({ turn: data.turn });
+      } else if (event === "status") {
+        const message = statusMessage(data);
+        if (message) setStatus(message);
+      } else if (event === "delta") {
+        streamText += data.text || "";
+        scheduleStreamRender();
+      } else if (event === "reset") {
+        streamText = "";
+        scheduleStreamRender();
+        setStatus(
+          data.reason === "truncation_retry"
+            ? "回答超长，正在重新生成…"
+            : "正在修正字段格式…"
+        );
+      } else if (event === "final") {
+        finalData = data;
+      } else if (event === "error") {
+        streamError = data;
+      }
+    });
+
+    if (streamError) throw new Error(streamError.message || "生成失败，请重试");
+    if (!finalData) throw new Error("连接中断，未收到完整回答");
+    persistSession(finalData.session?.session_id || sentSession);
+    renderResult(finalData);
+    addTurn(question, finalData.answer || "");
   } catch (error) {
     setStatus(error.message || "网络错误，请重试", "error");
   } finally {
@@ -220,7 +458,7 @@ async function ask() {
   }
 }
 
-$("submit").addEventListener("click", ask);
+$("submit").addEventListener("click", () => ask());
 $("question").addEventListener("keydown", (event) => {
   if (event.key === "Enter" && (event.ctrlKey || event.metaKey)) {
     event.preventDefault();
@@ -231,6 +469,16 @@ $("answer").addEventListener("click", (event) => {
   const cite = event.target.closest(".cite");
   if (cite) highlightSource(cite.dataset.doc);
 });
+$("new-session").addEventListener("click", () => {
+  clearSession("已开始新会话");
+  $("question").value = "";
+  $("question").focus();
+});
+$("role").addEventListener("change", () => {
+  clearSession("角色已切换，已开始新会话");
+});
 
 loadRoles();
 renderExamples();
+renderTranscript();
+updateSessionLine(null);

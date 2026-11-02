@@ -174,17 +174,19 @@ button[type="button"]:disabled { background: #9aa6cf; cursor: progress; }
   border-top: 1px dashed var(--line);
 }
 
-.example {
+.examples .example {
+  width: auto;
   border: 1px solid var(--line);
   border-radius: 999px;
   background: #fff;
   color: var(--muted);
   font-size: 12.5px;
+  font-weight: 400;
   padding: 5px 12px;
   cursor: pointer;
 }
 
-.example:hover {
+.examples .example:hover {
   border-color: #b8c5f8;
   color: var(--accent);
   background: var(--accent-soft);
@@ -246,8 +248,9 @@ button[type="button"]:disabled { background: #9aa6cf; cursor: progress; }
 .answer p { margin: 0 0 10px; }
 .answer strong { color: #0f1830; }
 
-.cite {
+.answer .cite {
   display: inline;
+  width: auto;
   border: 0;
   border-radius: 5px;
   background: var(--accent-soft);
@@ -259,7 +262,7 @@ button[type="button"]:disabled { background: #9aa6cf; cursor: progress; }
   cursor: pointer;
 }
 
-.cite:hover { background: #dfe5ff; text-decoration: underline; }
+.answer .cite:hover { background: #dfe5ff; text-decoration: underline; }
 
 .sources-head {
   display: flex;
@@ -375,6 +378,82 @@ button[type="button"]:disabled { background: #9aa6cf; cursor: progress; }
   color: #dbe4ff;
   font: 12.5px/1.55 ui-monospace, Consolas, monospace;
   white-space: pre-wrap;
+}
+
+.session-line {
+  margin: -4px 0 10px;
+}
+
+button.ghost {
+  border: 1px solid var(--line);
+  background: transparent;
+  color: var(--muted);
+  padding: 7px 14px;
+  font-weight: 600;
+}
+
+button.ghost:hover {
+  border-color: #c9d5ff;
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+
+.transcript { margin-top: 6px; }
+
+.transcript-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 10px;
+}
+
+.transcript-head h2 { margin: 0; font-size: 16px; }
+
+.turns {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 8px;
+  max-height: 260px;
+  overflow-y: auto;
+}
+
+.turns li {
+  padding: 9px 12px;
+  border: 1px solid var(--line);
+  border-radius: 11px;
+  background: #fbfcff;
+}
+
+.turn-q {
+  margin: 0;
+  font-size: 13.5px;
+  font-weight: 600;
+}
+
+.turn-a {
+  margin: 3px 0 0;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.answer.streaming {
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.answer.streaming::after {
+  content: "▍";
+  display: inline-block;
+  margin-left: 2px;
+  color: var(--accent);
+  animation: caret 1s steps(2, start) infinite;
+}
+
+@keyframes caret {
+  to { visibility: hidden; }
 }
 
 .hidden { display: none !important; }

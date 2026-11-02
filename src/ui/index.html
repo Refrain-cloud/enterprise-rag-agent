@@ -14,7 +14,7 @@
         <h1>企业知识库 Agent</h1>
         <p class="subtitle">按角色检索 · 版本权威判定 · 引用可追溯</p>
       </div>
-      <span class="stage-badge">M2 · LangGraph</span>
+      <span class="stage-badge">M3 · 多轮 + 流式</span>
     </header>
 
     <main>
@@ -26,18 +26,30 @@
             <input type="checkbox" id="debug">
             <span>显示节点轨迹</span>
           </label>
+          <button id="new-session" class="ghost" type="button">新会话</button>
+        </div>
+        <div class="session-line">
+          <span id="session-info" class="muted">新会话</span>
         </div>
         <label for="question" class="sr-only">问题</label>
         <textarea id="question" rows="3" maxlength="500"
           placeholder="例如：员工满 3 年不满 5 年，年休假有几天？"></textarea>
         <div class="actions">
-          <span class="hint">Ctrl + Enter 提交 · 回答严格基于已授权资料</span>
+          <span class="hint">Ctrl + Enter 提交 · 支持追问与流式回答 · 回答严格基于已授权资料</span>
           <button id="submit" type="button">提问</button>
         </div>
         <div id="examples" class="examples" aria-label="示例问题"></div>
       </section>
 
       <section id="status" class="status" role="status" aria-live="polite"></section>
+
+      <section id="transcript" class="panel transcript hidden" aria-label="对话记录">
+        <div class="transcript-head">
+          <h2>对话记录</h2>
+          <span class="hint">追问会结合最近几轮语境</span>
+        </div>
+        <ol id="turns" class="turns"></ol>
+      </section>
 
       <section id="result" class="panel result hidden" aria-live="polite">
         <div class="result-head">
