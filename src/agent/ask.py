@@ -8,6 +8,9 @@ from datetime import date
 from src.config import (
     AGG_TOP_K,
     CHAT_MODEL,
+    GENERATION_MAX_TOKENS,
+    GENERATION_MAX_TOKENS_CEILING,
+    GENERATION_MAX_TOKENS_HEADER,
     GENERATION_SEED,
     ROLES,
     STRUCTURED_FIELD_RETRY,
@@ -69,6 +72,28 @@ def _format_context(hits: list[dict]) -> str:
 
 
 CITE_PATTERN = re.compile(r"\[([A-Z]{2,}-\d+[A-Z]?)\]")
+
+
+def _generate_complete(
+    kind: str, messages: list[dict], max_tokens: int
+) -> tuple[object, list[dict]]:
+    """检测 finish_reason=length 并放宽预算重答；最多升到配置上限。"""
+    attempts: list[dict] = []
+    while True:
+        response = chat_completion(
+            kind if not attempts else f"{kind}_truncated_retry",
+            model=CHAT_MODEL,
+            messages=messages,
+            temperature=0,
+            max_tokens=max_tokens,
+            seed=GENERATION_SEED,
+        )
+        finish_reason = getattr(response.choices[0], "finish_reason", None)
+        attempts.append({"max_tokens": max_tokens, "finish_reason": finish_reason})
+        if finish_reason != "length" or max_tokens >= GENERATION_MAX_TOKENS_CEILING:
+            break
+        max_tokens = min(max_tokens * 2, GENERATION_MAX_TOKENS_CEILING)
+    return response, attempts
 
 # 结构化字段校验：从“字段：值”或两列表格行中取字段名，若回答里只出现取值而缺字段名，
 # 判为字段合并并重试一次。只使用检索到的原文，不读取题目 key_facts。
@@ -233,15 +258,13 @@ def answer(question: str, role: str = "普通员工", top_k: int = TOP_K) -> dic
         },
     ]
     # 表头与明细对比需要覆盖两份文档，给更长的输出预算
-    max_tokens = 1200 if ("表头" in question and "明细" in question) else 900
-    response = chat_completion(
-        "generate",
-        model=CHAT_MODEL,
-        messages=messages,
-        temperature=0,
-        max_tokens=max_tokens,
-        seed=GENERATION_SEED,
+    max_tokens = (
+        GENERATION_MAX_TOKENS_HEADER
+        if ("表头" in question and "明细" in question)
+        else GENERATION_MAX_TOKENS
     )
+    response, generation_attempts = _generate_complete("generate", messages, max_tokens)
+    max_tokens = generation_attempts[-1]["max_tokens"]
     text = response.choices[0].message.content.strip()
     stripped = _strip_literal_field_prefix(text)
     literal_prefix_stripped = stripped != text
@@ -260,17 +283,14 @@ def answer(question: str, role: str = "普通员工", top_k: int = TOP_K) -> dic
             f"{'、'.join(violations)}。请保留原有事实与引用，按“字段名：取值”逐行重写，"
             "字段名须与资料表格一致，不得把多个字段合并成一句。"
         )
-        retry = chat_completion(
+        retry, retry_attempts = _generate_complete(
             "generate_retry",
-            model=CHAT_MODEL,
-            messages=[
+            [
                 *messages,
                 {"role": "assistant", "content": text},
                 {"role": "user", "content": correction},
             ],
-            temperature=0,
-            max_tokens=max_tokens,
-            seed=GENERATION_SEED,
+            max_tokens,
         )
         retry_text = _strip_literal_field_prefix(
             retry.choices[0].message.content.strip()
@@ -281,6 +301,7 @@ def answer(question: str, role: str = "普通员工", top_k: int = TOP_K) -> dic
                 "retried": True,
                 "remaining": remaining,
                 "fixed": not remaining,
+                "retry_truncation": retry_attempts,
             }
         )
         if len(remaining) <= len(violations):
@@ -292,6 +313,10 @@ def answer(question: str, role: str = "普通员工", top_k: int = TOP_K) -> dic
         "denied": False,
         "route": "rag",
         "format_check": format_check,
+        "generation_check": {
+            "truncation": generation_attempts,
+            "retried_on_truncation": len(generation_attempts) > 1,
+        },
     }
 
 

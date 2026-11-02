@@ -57,6 +57,11 @@ TABLE_SAMPLE_ROWS = 3
 TABLE_RESULT_PROMPT_ROWS = 20
 TABLE_SQL_MAX_TOKENS = 400
 
+# 生成预算：截断检测命中后逐级放宽，避免长答案停在半句
+GENERATION_MAX_TOKENS = int(os.getenv("RAG_MAX_TOKENS", "900"))
+GENERATION_MAX_TOKENS_HEADER = int(os.getenv("RAG_MAX_TOKENS_HEADER", "1200"))
+GENERATION_MAX_TOKENS_CEILING = int(os.getenv("RAG_MAX_TOKENS_CEILING", "2400"))
+
 
 def get_api_key() -> str:
     key = os.getenv("DASHSCOPE_API_KEY") or os.getenv("OPENAI_API_KEY")

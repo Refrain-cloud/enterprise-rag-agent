@@ -18,8 +18,8 @@ from src.config import CHAT_MODEL, BUILD_DIR, TOP_K
 from src.llm import chat_completion, merge_usage, reset_usage, usage_snapshot
 from src.retrieval.search import hybrid_search, reset_search_stats, search_stats
 
-# v3 已归档（deprecated），保留用于历史报告复现；v4 是 v3 的超集
-QUESTIONS_PATH = Path(__file__).resolve().parent / "questions.v4.jsonl"
+# v3 已归档，v4 保留为 120 题基线；v5 在 v4 基础上补充 md 表格汇总题
+QUESTIONS_PATH = Path(__file__).resolve().parent / "questions.v5.jsonl"
 REPORT_DIR = BUILD_DIR / "eval"
 CORPUS_PATH = BUILD_DIR / "corpus" / "docs.jsonl"
 CITE_PATTERN = re.compile(r"\[([A-Z]+-\d+[A-Z]?)\]")
@@ -159,6 +159,7 @@ def _judge_fingerprint(question: dict) -> str:
 REFUSAL_MARKERS = [
     "无权", "无法访问", "无法回答", "无法确定", "无法判断", "不能提供",
     "没有找到", "未找到", "没有相关", "不存在", "已终止", "没有下一阶段",
+    "无法从现有资料", "无法从资料", "无法确证", "未在正文中列出", "未随文归档",
 ]
 STRICT_REFUSAL_MARKERS = [
     "无权", "无法访问", "无法回答", "无法确定", "无法判断",
@@ -168,6 +169,7 @@ ABSENCE_REFUSAL_MARKERS = [
     "不存在", "未提及", "已终止", "没有下一阶段", "无下一阶段",
     "没有相关信息", "无相关信息",
     "未最终确定", "尚未确定", "未确定是否", "尚未最终确定",
+    "无法从现有资料", "无法从资料", "无法确证", "未在正文中列出", "未随文归档",
 ]
 
 JUDGE_PROMPT = """你是 RAG 评估中的事实提取员，只做核对，不评分，不写分析。
@@ -1197,6 +1199,7 @@ def evaluate(
             "judge_usage": judge_usage,
             "generation_stability": stability,
             "format_check": response.get("format_check"),
+            "generation_check": response.get("generation_check"),
         }
         if repeat_count > 1:
             result["generation_answers"] = [item["answer"] for item in responses]
@@ -1225,6 +1228,10 @@ def evaluate(
                     )
                 else:
                     suffix += f" fmt_violation={check['violations']}"
+        generation_check = response.get("generation_check") or {}
+        attempts = generation_check.get("truncation") or []
+        if attempts and attempts[-1]["finish_reason"] == "length":
+            suffix += f" truncated_at={attempts[-1]['max_tokens']}"
         print(
             f"  retrieval_hit={result['retrieval_hit']} cites_gold={cites_gold} "
             f"score={judged['score']} faithful={judged['faithful']} "
@@ -2335,7 +2342,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--questions",
         default=str(QUESTIONS_PATH),
-        help="题目文件（默认 v4；v3 已归档）",
+        help="题目文件（默认 v5；v4 保留为 120 题基线）",
     )
     parser.add_argument(
         "--report-stem",

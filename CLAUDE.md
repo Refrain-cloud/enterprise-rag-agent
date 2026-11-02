@@ -57,7 +57,7 @@ python -m pip install -r requirements.txt
 python -m src.ingest.build_corpus          # 解析 data/kb → build/corpus
 python -m src.retrieval.index --rebuild    # 分块、embedding、Chroma、BM25
 python -m src.agent.ask "员工年假几天？" --role 普通员工
-python -m eval.run_eval                    # 120 题 baseline（默认 v4；日常 judge×1，出稿验收加 --judge-repeats 3）
+python -m eval.run_eval                    # 121 题 baseline（默认 v5；v4 保留为 120 题基线；日常 judge×1，出稿验收加 --judge-repeats 3）
 ```
 
 Windows 控制台输出中文时加 `PYTHONIOENCODING=utf-8`，否则可能乱码。
