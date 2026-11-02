@@ -1,0 +1,364 @@
+from __future__ import annotations
+
+import time
+
+from src.config import (
+    AGG_TOP_K,
+    CHAT_MODEL,
+    GENERATION_SEED,
+    REWRITE_MAX_TOKENS,
+    REWRITE_ON_EMPTY,
+    TABLE_TOOL_ENABLED,
+    TOP_K,
+)
+from src.llm import chat_completion
+from src.retrieval.search import hybrid_search
+from src.security.policy import can_access, normalize_role
+from src.tools.sql_tool import (
+    answer_with_scanned_tables,
+    answer_with_tables,
+    eligible_table_hits,
+    is_aggregation_question,
+)
+
+from .runtime import (
+    CITE_PATTERN,
+    ensure_draft_disclosure,
+    generate_rag_answer,
+    sources,
+)
+from .state import AgentState, trace_event
+
+DENIED_ANSWER = "该信息属于公司机密，当前角色无权访问。"
+NOT_FOUND_ANSWER = "知识库中没有找到与该问题相关且你有权访问的资料，无法回答。"
+
+REWRITE_SYSTEM_PROMPT = """你是知识库检索查询改写助手。把用户问题改写成更适合中文向量与关键词检索的查询：
+补全指代和省略信息，保留专有名词、编号、日期、部门名与业务术语，可以补充同义词；
+不要回答问题，不要解释，不要加引号，只输出一行改写后的查询。"""
+
+
+def _doc_ids(hits: list[dict], limit: int = 8) -> list[str]:
+    return [hit["metadata"].get("doc_id", "") for hit in hits[:limit]]
+
+
+def prepare_node(state: AgentState) -> dict:
+    started = time.perf_counter()
+    role = normalize_role(state.get("role", "普通员工"))
+    return {
+        "role": role,
+        "trace": [
+            trace_event(
+                state,
+                "prepare",
+                started,
+                summary={"role": role, "top_k": state.get("top_k", TOP_K)},
+            )
+        ],
+    }
+
+
+def _rewrite_query(question: str) -> str:
+    response = chat_completion(
+        "rewrite",
+        model=CHAT_MODEL,
+        messages=[
+            {"role": "system", "content": REWRITE_SYSTEM_PROMPT},
+            {"role": "user", "content": question},
+        ],
+        temperature=0,
+        max_tokens=REWRITE_MAX_TOKENS,
+        seed=GENERATION_SEED,
+    )
+    text = response.choices[0].message.content.strip().strip("\"'“”")
+    return text.splitlines()[0].strip() if text else ""
+
+
+def retrieve_node(state: AgentState) -> dict:
+    started = time.perf_counter()
+    question = state["question"]
+    role = state["role"]
+    top_k = state.get("top_k", TOP_K)
+
+    hits = hybrid_search(question, role=role, top_k=top_k)
+    calls = 1
+    queries = [question]
+    if (
+        TABLE_TOOL_ENABLED
+        and is_aggregation_question(question)
+        and not eligible_table_hits(hits, role)
+    ):
+        hits = hybrid_search(question, role=role, top_k=max(top_k, AGG_TOP_K))
+        calls += 1
+
+    best_overall = hybrid_search(
+        question, role=role, top_k=1, ignore_permissions=True
+    )
+    calls += 1
+
+    rewrite = {"triggered": False, "query": None, "succeeded": False}
+    best_blocked = bool(
+        best_overall and not can_access(role, best_overall[0]["metadata"])
+    )
+    if not hits and REWRITE_ON_EMPTY and not best_blocked:
+        rewritten = _rewrite_query(question)
+        if rewritten and rewritten != question:
+            calls += 1
+            queries.append(rewritten)
+            rewrite = {"triggered": True, "query": rewritten, "succeeded": False}
+            hits = hybrid_search(rewritten, role=role, top_k=top_k)
+            rewrite["succeeded"] = bool(hits)
+
+    return {
+        "hits": hits,
+        "best_overall": best_overall,
+        "retrieval_calls": calls,
+        "retrieval_queries": queries,
+        "rewrite": rewrite,
+        "trace": [
+            trace_event(
+                state,
+                "retrieve",
+                started,
+                summary={
+                    "doc_ids": _doc_ids(hits),
+                    "calls": calls,
+                    "rewrite": rewrite,
+                },
+            )
+        ],
+    }
+
+
+def guard_node(state: AgentState) -> dict:
+    started = time.perf_counter()
+    hits = state.get("hits") or []
+    best_overall = state.get("best_overall") or []
+    role = state["role"]
+
+    def denied() -> dict:
+        return {
+            "terminal": "denied",
+            "answer": DENIED_ANSWER,
+            "sources": [],
+            "hits": [],
+            "route": "rag",
+        }
+
+    if not hits:
+        if best_overall and not can_access(role, best_overall[0]["metadata"]):
+            return {
+                **denied(),
+                "trace": [
+                    trace_event(
+                        state,
+                        "guard",
+                        started,
+                        status="denied",
+                        summary={"reason": "unauthorized_best_match"},
+                    )
+                ],
+            }
+        return {
+            "terminal": "not_found",
+            "answer": NOT_FOUND_ANSWER,
+            "sources": [],
+            "hits": [],
+            "route": "rag",
+            "trace": [
+                trace_event(
+                    state,
+                    "guard",
+                    started,
+                    status="not_found",
+                    summary={"reason": "no_accessible_hits"},
+                )
+            ],
+        }
+
+    if best_overall and not can_access(role, best_overall[0]["metadata"]):
+        if str(best_overall[0]["metadata"].get("scope", "")).startswith("dept:"):
+            return {
+                **denied(),
+                "trace": [
+                    trace_event(
+                        state,
+                        "guard",
+                        started,
+                        status="denied",
+                        summary={"reason": "dept_confidential_best_match"},
+                    )
+                ],
+            }
+
+    return {
+        "trace": [
+            trace_event(
+                state,
+                "guard",
+                started,
+                summary={"passed": True, "hits": len(hits)},
+            )
+        ]
+    }
+
+
+def route_node(state: AgentState) -> dict:
+    started = time.perf_counter()
+    decision = (
+        "structured"
+        if TABLE_TOOL_ENABLED and is_aggregation_question(state["question"])
+        else "rag"
+    )
+    return {
+        "route_decision": decision,
+        "trace": [
+            trace_event(
+                state,
+                "route",
+                started,
+                summary={
+                    "decision": decision,
+                    "aggregation": is_aggregation_question(state["question"]),
+                },
+            )
+        ],
+    }
+
+
+def structured_node(state: AgentState) -> dict:
+    started = time.perf_counter()
+    question = state["question"]
+    role = state["role"]
+    hits = state.get("hits") or []
+
+    tool_result = answer_with_tables(question, role, hits)
+    if not tool_result:
+        tool_result = answer_with_scanned_tables(question, role, hits)
+
+    if not tool_result:
+        return {
+            "tool_result": None,
+            "trace": [
+                trace_event(
+                    state,
+                    "structured",
+                    started,
+                    status="fallback",
+                    summary={"reason": "no_structured_result"},
+                )
+            ],
+        }
+
+    used_doc_ids = set(tool_result.get("table_doc_ids", []))
+    tool_result["hits"] = hits
+    tool_result["sources"] = sources(
+        [hit for hit in hits if hit["metadata"]["doc_id"] in used_doc_ids]
+    )
+    tool_result["denied"] = False
+    return {
+        "tool_result": tool_result,
+        "answer": tool_result["answer"],
+        "sources": tool_result["sources"],
+        "route": tool_result.get("route", "sql"),
+        "trace": [
+            trace_event(
+                state,
+                "structured",
+                started,
+                summary={
+                    "tool": tool_result.get("route", "sql"),
+                    "doc_ids": sorted(used_doc_ids),
+                },
+            )
+        ],
+    }
+
+
+def generate_node(state: AgentState) -> dict:
+    started = time.perf_counter()
+    question = state["question"]
+    role = state["role"]
+    hits = state.get("hits") or []
+    generated = generate_rag_answer(question, role, hits)
+    return {
+        "answer": generated["text"],
+        "sources": sources(hits),
+        "route": "rag",
+        "format_check": generated["format_check"],
+        "generation_check": generated["generation_check"],
+        "trace": [
+            trace_event(
+                state,
+                "generate",
+                started,
+                summary={
+                    "doc_ids": _doc_ids(hits),
+                    "retried_on_truncation": generated["generation_check"][
+                        "retried_on_truncation"
+                    ],
+                },
+            )
+        ],
+    }
+
+
+def self_check_node(state: AgentState) -> dict:
+    started = time.perf_counter()
+    answer = (state.get("answer") or "").strip()
+    hits = state.get("hits") or []
+    hit_ids = {hit["metadata"]["doc_id"] for hit in hits}
+    cited = set(CITE_PATTERN.findall(answer))
+    unresolved = sorted(cited - hit_ids)
+    empty = not answer
+    denied = state.get("terminal") == "denied"
+    denied_consistent = not (denied and state.get("sources"))
+
+    findings: list[dict] = []
+    if empty:
+        findings.append({"type": "empty_answer"})
+    if unresolved:
+        findings.append({"type": "unresolved_citation", "doc_ids": unresolved})
+    if not denied_consistent:
+        findings.append({"type": "denied_with_sources"})
+
+    self_check = {
+        "ok": not findings,
+        "empty_answer": empty,
+        "citations_total": len(cited),
+        "unresolved_citations": unresolved,
+        "denied_consistent": denied_consistent,
+        "findings": findings,
+    }
+    return {
+        "self_check": self_check,
+        "trace": [
+            trace_event(
+                state,
+                "self_check",
+                started,
+                status="ok" if self_check["ok"] else "warning",
+                summary={
+                    "findings": [item["type"] for item in findings],
+                    "citations": len(cited),
+                },
+            )
+        ],
+    }
+
+
+def finalize_node(state: AgentState) -> dict:
+    started = time.perf_counter()
+    answer = state.get("answer") or ""
+    if state.get("terminal") is None and state.get("route") == "rag":
+        answer = ensure_draft_disclosure(answer, state.get("hits") or [])
+    return {
+        "answer": answer,
+        "trace": [
+            trace_event(
+                state,
+                "finalize",
+                started,
+                summary={"route": state.get("route", "rag")},
+            )
+        ],
+    }

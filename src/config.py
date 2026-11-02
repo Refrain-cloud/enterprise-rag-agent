@@ -62,6 +62,15 @@ GENERATION_MAX_TOKENS = int(os.getenv("RAG_MAX_TOKENS", "900"))
 GENERATION_MAX_TOKENS_HEADER = int(os.getenv("RAG_MAX_TOKENS_HEADER", "1200"))
 GENERATION_MAX_TOKENS_CEILING = int(os.getenv("RAG_MAX_TOKENS_CEILING", "2400"))
 
+# 零命中时允许一次查询改写后重检索；正常题不触发额外模型调用
+REWRITE_ON_EMPTY = os.getenv("RAG_REWRITE_ON_EMPTY", "1") not in {"0", "false", "False"}
+REWRITE_MAX_TOKENS = int(os.getenv("RAG_REWRITE_MAX_TOKENS", "80"))
+
+# 服务层并发与超时
+API_MAX_CONCURRENCY = int(os.getenv("RAG_API_MAX_CONCURRENCY", "4"))
+API_QUEUE_TIMEOUT_S = float(os.getenv("RAG_API_QUEUE_TIMEOUT_S", "5"))
+API_REQUEST_TIMEOUT_S = float(os.getenv("RAG_API_REQUEST_TIMEOUT_S", "120"))
+
 
 def get_api_key() -> str:
     key = os.getenv("DASHSCOPE_API_KEY") or os.getenv("OPENAI_API_KEY")

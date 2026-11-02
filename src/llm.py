@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextvars
 import json
 import os
 import threading
@@ -19,6 +20,10 @@ DEFAULT_PRICES = {
 
 _LOCK = threading.Lock()
 _RECORDS: list[dict[str, Any]] = []
+# 服务层按请求收集用量：ContextVar 里的 list 会被 to_thread 复制的上下文共享。
+_REQUEST_RECORDS: contextvars.ContextVar[list[dict[str, Any]] | None] = (
+    contextvars.ContextVar("request_usage_records", default=None)
+)
 
 
 def _prices() -> dict[str, dict[str, float]]:
@@ -66,6 +71,19 @@ def record_usage(
     }
     with _LOCK:
         _RECORDS.append(record)
+    request_records = _REQUEST_RECORDS.get()
+    if request_records is not None:
+        request_records.append(record)
+
+
+def start_request_usage() -> list[dict[str, Any]]:
+    records: list[dict[str, Any]] = []
+    _REQUEST_RECORDS.set(records)
+    return records
+
+
+def summarize_records(records: list[dict[str, Any]]) -> dict[str, Any]:
+    return _summarize(records)
 
 
 def _record_response(kind: str, model: str, response: Any, elapsed_s: float) -> None:

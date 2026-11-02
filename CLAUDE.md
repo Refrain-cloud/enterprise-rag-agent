@@ -2,7 +2,7 @@
 
 面向企业内部知识库的问答 Agent。知识库位于 `data/kb/`，公司设定为北辰智造科技（197 人，工业软件 / MES）。项目必须配套可量化的评估集（`eval/`），不以"能跑通 demo"为完成标准。
 
-当前阶段：M1 数据底座（解析、元数据、种子评估集、baseline）。
+当前阶段：M2 服务层（LangGraph 状态图、节点轨迹、FastAPI、Web Demo）；M1 的 v5 评估基线已冻结。
 
 ## 技术选型
 
@@ -58,6 +58,8 @@ python -m src.ingest.build_corpus          # 解析 data/kb → build/corpus
 python -m src.retrieval.index --rebuild    # 分块、embedding、Chroma、BM25
 python -m src.agent.ask "员工年假几天？" --role 普通员工
 python -m eval.run_eval                    # 121 题 baseline（默认 v5；v4 保留为 120 题基线；日常 judge×1，出稿验收加 --judge-repeats 3）
+python -m unittest discover -s tests -v    # 节点、运行时与 API 单元测试
+python -m uvicorn src.api.main:app --port 8000   # FastAPI + Web Demo，浏览器打开 http://127.0.0.1:8000
 ```
 
 Windows 控制台输出中文时加 `PYTHONIOENCODING=utf-8`，否则可能乱码。

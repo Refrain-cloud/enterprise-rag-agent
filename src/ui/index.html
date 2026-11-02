@@ -1,0 +1,73 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>北辰智造 · 知识库 Agent</title>
+  <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+  <div class="page">
+    <header class="masthead">
+      <div>
+        <p class="eyebrow">BEICHEN SMART MANUFACTURING</p>
+        <h1>企业知识库 Agent</h1>
+        <p class="subtitle">按角色检索 · 版本权威判定 · 引用可追溯</p>
+      </div>
+      <span class="stage-badge">M2 · LangGraph</span>
+    </header>
+
+    <main>
+      <section class="panel ask-panel">
+        <div class="controls">
+          <label for="role">当前角色</label>
+          <select id="role" aria-label="选择角色"></select>
+          <label class="toggle">
+            <input type="checkbox" id="debug">
+            <span>显示节点轨迹</span>
+          </label>
+        </div>
+        <label for="question" class="sr-only">问题</label>
+        <textarea id="question" rows="3" maxlength="500"
+          placeholder="例如：员工满 3 年不满 5 年，年休假有几天？"></textarea>
+        <div class="actions">
+          <span class="hint">Ctrl + Enter 提交 · 回答严格基于已授权资料</span>
+          <button id="submit" type="button">提问</button>
+        </div>
+        <div id="examples" class="examples" aria-label="示例问题"></div>
+      </section>
+
+      <section id="status" class="status" role="status" aria-live="polite"></section>
+
+      <section id="result" class="panel result hidden" aria-live="polite">
+        <div class="result-head">
+          <span id="route-badge" class="badge"></span>
+          <span id="latency" class="muted"></span>
+          <span id="usage" class="muted"></span>
+          <span id="request-id" class="muted request-id"></span>
+        </div>
+        <div id="denied" class="denied hidden">该信息属于公司机密，当前角色无权访问。</div>
+        <div id="answer" class="answer"></div>
+
+        <div class="sources-head">
+          <h2>来源</h2>
+          <span class="hint">点击答案中的 [DOC-ID] 可定位来源</span>
+        </div>
+        <div id="sources" class="sources"></div>
+
+        <details id="debug-panel" class="debug hidden">
+          <summary>节点轨迹与自检</summary>
+          <ol id="trace" class="trace"></ol>
+          <h3>self_check</h3>
+          <pre id="self-check" class="code"></pre>
+        </details>
+      </section>
+    </main>
+
+    <footer class="footer">
+      <span>检索层强制权限过滤 · 草稿/废止版本不作为依据 · 结构化问题走 SQL 工具</span>
+    </footer>
+  </div>
+  <script src="/static/app.js" defer></script>
+</body>
+</html>

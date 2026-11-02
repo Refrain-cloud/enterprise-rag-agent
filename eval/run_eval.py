@@ -13,6 +13,7 @@ from datetime import datetime
 from functools import lru_cache
 from pathlib import Path
 
+from eval.trajectory import summarize as summarize_trajectory
 from src.agent.ask import answer
 from src.config import CHAT_MODEL, BUILD_DIR, TOP_K
 from src.llm import chat_completion, merge_usage, reset_usage, usage_snapshot
@@ -1200,6 +1201,12 @@ def evaluate(
             "generation_stability": stability,
             "format_check": response.get("format_check"),
             "generation_check": response.get("generation_check"),
+            "self_check": response.get("self_check"),
+            "trace": response.get("trace"),
+            "trace_meta": response.get("trace_meta"),
+            "rewrite": response.get("rewrite"),
+            "retrieval_queries": (response.get("retrieval") or {}).get("queries"),
+            "citations": response.get("citations"),
         }
         if repeat_count > 1:
             result["generation_answers"] = [item["answer"] for item in responses]
@@ -2008,6 +2015,9 @@ def _aggregate(results: list[dict], source: str) -> dict:
             "route_counts": dict(sorted(Counter(result["route"] for result in results).items())),
             "generation_stability": generation_stability,
             "format_check": format_check,
+            "trajectory": summarize_trajectory(
+                results, REPORT_DIR / "route_reference.json"
+            ),
         },
         "by_category": category_metrics,
         "cost": _cost_summary(results),
@@ -2053,6 +2063,19 @@ def _write_markdown(report: dict, path: Path) -> None:
         f"- 权限合规率：{metrics['permission_ok_rate']}",
         f"- 权限泄漏数：{metrics['permission_leaks']}",
         f"- 路由分布：{metrics['route_counts']}",
+        *(
+            [
+                f"- 轨迹：路由一致率 {_fmt_float(traj.get('route_consistency'))}"
+                f"（{traj['route_reference_size']} 题可比），"
+                f"结构化尝试 {traj['structured_attempts']} 题"
+                f"（回落 {traj['structured_fallbacks']}），"
+                f"改写触发 {traj['rewrite_triggered']} 题"
+                f"（成功 {traj['rewrite_succeeded']}），"
+                f"自检告警 {traj['self_check_warnings']}/{traj['self_check_questions']} 题",
+            ]
+            if (traj := metrics.get("trajectory"))
+            else []
+        ),
         *(
             [
                 f"- 生成重复：{gen['repeats']} 次/题；归一化完全一致 "

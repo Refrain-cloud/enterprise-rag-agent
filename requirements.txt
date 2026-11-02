@@ -8,3 +8,6 @@ pypdf>=6.0
 openpyxl>=3.1
 rank-bm25>=0.2.2
 jieba>=0.42
+langgraph>=1.2,<2
+fastapi>=0.136,<1
+uvicorn>=0.47,<1
