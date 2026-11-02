@@ -58,6 +58,27 @@ class GuardTest(unittest.TestCase):
         )
         self.assertEqual(result["terminal"], "denied")
 
+    def test_dept_confidential_denies_when_restricted_is_far_closer(self) -> None:
+        result = guard_node(
+            state(
+                hits=[hit()],
+                best_overall=[hit("confidential", "dept:IT")],
+                access_margin={"gap": 0.1},
+            )
+        )
+        self.assertEqual(result["terminal"], "denied")
+
+    def test_dept_confidential_passes_when_accessible_is_close(self) -> None:
+        result = guard_node(
+            state(
+                hits=[hit()],
+                best_overall=[hit("confidential", "dept:IT")],
+                access_margin={"gap": 0.0004},
+            )
+        )
+        self.assertNotIn("terminal", result)
+        self.assertEqual(result["trace"][0]["status"], "ok")
+
 
 class RouteTest(unittest.TestCase):
     def test_aggregation_question_routes_to_structured(self) -> None:

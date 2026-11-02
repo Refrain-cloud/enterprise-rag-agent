@@ -153,3 +153,46 @@ def _hybrid_search(
             }
         )
     return results
+
+
+def access_gap(query: str, role: str, candidate_k: int = CANDIDATE_K) -> dict:
+    """比较可访问与受限文档的最优向量距离，供 guard 区分“问机密”与“路过机密”。"""
+    started = time.perf_counter()
+    try:
+        by_id, _, collection = _load_resources()
+        result = collection.query(
+            query_embeddings=[_embed_query(query)],
+            n_results=candidate_k,
+            include=["metadatas", "distances"],
+        )
+        accessible: tuple[float, dict] | None = None
+        restricted: tuple[float, dict] | None = None
+        for chunk_id, distance in zip(result["ids"][0], result["distances"][0]):
+            chunk = by_id.get(chunk_id)
+            if not chunk:
+                continue
+            meta = chunk["metadata"]
+            if can_access(role, meta):
+                if accessible is None or distance < accessible[0]:
+                    accessible = (distance, meta)
+            elif restricted is None or distance < restricted[0]:
+                restricted = (distance, meta)
+        return {
+            "accessible_distance": (
+                None if accessible is None else round(accessible[0], 4)
+            ),
+            "restricted_distance": (
+                None if restricted is None else round(restricted[0], 4)
+            ),
+            "restricted_doc_id": (
+                None if restricted is None else restricted[1].get("doc_id")
+            ),
+            "gap": (
+                None
+                if accessible is None or restricted is None
+                else round(accessible[0] - restricted[0], 4)
+            ),
+        }
+    finally:
+        _SEARCH_STATS["calls"] += 1
+        _SEARCH_STATS["elapsed_s"] += time.perf_counter() - started

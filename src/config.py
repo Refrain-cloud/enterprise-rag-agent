@@ -29,6 +29,8 @@ TOP_K = int(os.getenv("RAG_TOP_K", "12"))
 CANDIDATE_K = int(os.getenv("RAG_CANDIDATE_K", "40"))
 # 聚合题需要更宽的候选集，避免表格文档被叙述型文档挤出 top-K
 AGG_TOP_K = int(os.getenv("RAG_AGG_TOP_K", "16"))
+# 受限最优命中的余弦距离比可访问最优命中近多少才判定为“问的就是机密内容”
+GUARD_DISTANCE_GAP = float(os.getenv("RAG_GUARD_DISTANCE_GAP", "0.03"))
 
 RERANK_ENABLED = os.getenv("RAG_RERANK", "0") not in {"0", "false", "False"}
 RERANK_MODEL = os.getenv("RAG_RERANK_MODEL", "gte-rerank-v2")

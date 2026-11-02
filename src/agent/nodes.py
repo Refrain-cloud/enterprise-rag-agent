@@ -4,17 +4,19 @@ import time
 
 from src.config import (
     AGG_TOP_K,
+    CANDIDATE_K,
     CHAT_MODEL,
     FOLLOWUP_MAX_TOKENS,
     FOLLOWUP_REWRITE,
     GENERATION_SEED,
+    GUARD_DISTANCE_GAP,
     REWRITE_MAX_TOKENS,
     REWRITE_ON_EMPTY,
     TABLE_TOOL_ENABLED,
     TOP_K,
 )
 from src.llm import chat_completion
-from src.retrieval.search import hybrid_search
+from src.retrieval.search import access_gap, hybrid_search
 from src.security.policy import can_access, normalize_role
 from src.tools.sql_tool import (
     answer_with_scanned_tables,
@@ -152,6 +154,16 @@ def retrieve_node(state: AgentState) -> dict:
     best_blocked = bool(
         best_overall and not can_access(role, best_overall[0]["metadata"])
     )
+    access_margin = None
+    if (
+        hits
+        and best_blocked
+        and str(best_overall[0]["metadata"].get("scope", "")).startswith("dept:")
+    ):
+        access_margin = access_gap(
+            question, role, max(top_k * 4, CANDIDATE_K)
+        )
+        calls += 1
     if not hits and REWRITE_ON_EMPTY and not best_blocked:
         rewritten = _rewrite_query(question)
         if rewritten and rewritten != question:
@@ -165,6 +177,7 @@ def retrieve_node(state: AgentState) -> dict:
     return {
         "hits": hits,
         "best_overall": best_overall,
+        "access_margin": access_margin,
         "retrieval_calls": calls,
         "retrieval_queries": queries,
         "rewrite": rewrite,
@@ -233,18 +246,24 @@ def guard_node(state: AgentState) -> dict:
 
     if best_overall and not can_access(role, best_overall[0]["metadata"]):
         if str(best_overall[0]["metadata"].get("scope", "")).startswith("dept:"):
-            return {
-                **denied(),
-                "trace": [
-                    trace_event(
-                        state,
-                        "guard",
-                        started,
-                        status="denied",
-                        summary={"reason": "dept_confidential_best_match"},
-                    )
-                ],
-            }
+            gap = (state.get("access_margin") or {}).get("gap")
+            # 可访问文档与受限最优命中距离接近时，问的是制度本身，按可回答处理
+            if gap is None or gap > GUARD_DISTANCE_GAP:
+                return {
+                    **denied(),
+                    "trace": [
+                        trace_event(
+                            state,
+                            "guard",
+                            started,
+                            status="denied",
+                            summary={
+                                "reason": "dept_confidential_best_match",
+                                "gap": gap,
+                            },
+                        )
+                    ],
+                }
 
     emit_status("guard", "done", status="passed", hits=len(hits))
     return {

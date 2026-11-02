@@ -31,6 +31,7 @@ class AgentState(TypedDict, total=False):
 
     hits: list[dict]
     best_overall: list[dict]
+    access_margin: dict | None
     retrieval_calls: int
     retrieval_queries: list[str]
     rewrite: dict
