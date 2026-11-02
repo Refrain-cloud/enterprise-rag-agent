@@ -2,7 +2,7 @@
 
 面向企业内部知识库的问答 Agent。知识库位于 `data/kb/`，公司设定为北辰智造科技（197 人，工业软件 / MES）。项目必须配套可量化的评估集（`eval/`），不以"能跑通 demo"为完成标准。
 
-当前阶段：M2 服务层（LangGraph 状态图、节点轨迹、FastAPI、Web Demo）；M1 的 v5 评估基线已冻结。
+当前阶段：M3 多轮会话与 token 级流式（应用层会话存储、SSE、Web Demo 流式渲染）；M2 的 121 题 2.0 基线仍为默认基线。
 
 ## 技术选型
 
@@ -11,7 +11,7 @@
 - Embedding：`text-embedding-v3`
 - 编排：LangGraph，**只负责路由与状态流转**
 - 检索：Chroma（向量）+ BM25（关键词）+ 元数据过滤；可选 rerank（DashScope `gte-rerank-v2`，`RAG_RERANK=1` 开启，默认关闭，只重排已召回的 top-k）；表格数据用 DuckDB / pandas
-- 服务：FastAPI + 简易 Web Demo（角色切换、引用展示）
+- 服务：FastAPI + 简易 Web Demo（角色切换、引用展示、多轮会话、SSE 流式）；会话状态在应用层内存存储，图保持无状态
 - 所有密钥从环境变量读取，禁止硬编码
 
 ## 数据与元数据
@@ -60,6 +60,10 @@ python -m src.agent.ask "员工年假几天？" --role 普通员工
 python -m eval.run_eval                    # 121 题 baseline（默认 v5；v4 保留为 120 题基线；日常 judge×1，出稿验收加 --judge-repeats 3）
 python -m unittest discover -s tests -v    # 节点、运行时与 API 单元测试
 python -m uvicorn src.api.main:app --port 8000   # FastAPI + Web Demo，浏览器打开 http://127.0.0.1:8000
+
+# 流式问答（SSE）；多轮时把上一轮 meta 的 session_id 带上
+curl -N -X POST http://127.0.0.1:8000/api/ask/stream -H "Content-Type: application/json" \
+  -d '{"question":"员工年假几天？","role":"普通员工"}'
 ```
 
 Windows 控制台输出中文时加 `PYTHONIOENCODING=utf-8`，否则可能乱码。
