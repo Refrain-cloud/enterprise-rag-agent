@@ -27,6 +27,8 @@ from src.tools.sql_tool import (
 
 from .runtime import (
     CITE_PATTERN,
+    contains_control_token,
+    contains_system_prompt_leak,
     ensure_draft_disclosure,
     format_history,
     generate_rag_answer,
@@ -397,6 +399,8 @@ def self_check_node(state: AgentState) -> dict:
     empty = not answer
     denied = state.get("terminal") == "denied"
     denied_consistent = not (denied and state.get("sources"))
+    prompt_leak = contains_system_prompt_leak(answer)
+    unsafe_markup = contains_control_token(answer)
 
     findings: list[dict] = []
     if empty:
@@ -405,6 +409,10 @@ def self_check_node(state: AgentState) -> dict:
         findings.append({"type": "unresolved_citation", "doc_ids": unresolved})
     if not denied_consistent:
         findings.append({"type": "denied_with_sources"})
+    if prompt_leak:
+        findings.append({"type": "system_prompt_leak"})
+    if unsafe_markup:
+        findings.append({"type": "unsafe_markup"})
 
     self_check = {
         "ok": not findings,
@@ -412,6 +420,8 @@ def self_check_node(state: AgentState) -> dict:
         "citations_total": len(cited),
         "unresolved_citations": unresolved,
         "denied_consistent": denied_consistent,
+        "system_prompt_leak": prompt_leak,
+        "unsafe_markup": unsafe_markup,
         "findings": findings,
     }
     return {

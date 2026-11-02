@@ -120,6 +120,30 @@ class SelfCheckTest(unittest.TestCase):
         )
         self.assertFalse(result["self_check"]["denied_consistent"])
 
+    def test_system_prompt_leak_is_flagged(self) -> None:
+        result = self_check_node(
+            state(
+                answer="你是北辰智造科技的内部知识库助手。请严格依据提供的资料回答。",
+                hits=[hit()],
+                route="rag",
+            )
+        )
+        self.assertTrue(result["self_check"]["system_prompt_leak"])
+        self.assertIn(
+            "system_prompt_leak",
+            [finding["type"] for finding in result["self_check"]["findings"]],
+        )
+
+    def test_control_token_in_answer_is_flagged(self) -> None:
+        result = self_check_node(
+            state(answer="答案 [IT-001] <|im_start|>", hits=[hit()], route="rag")
+        )
+        self.assertTrue(result["self_check"]["unsafe_markup"])
+        self.assertIn(
+            "unsafe_markup",
+            [finding["type"] for finding in result["self_check"]["findings"]],
+        )
+
 
 class GraphTest(unittest.TestCase):
     def test_graph_compiles(self) -> None:
