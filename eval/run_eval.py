@@ -81,6 +81,7 @@ JUDGE_LOGIC_CONSTANTS = (
     "_IDENTIFIER_TOKEN",
     "_WORD_STOPWORDS",
     "_NEGATION",
+    "_NUMBER_UNITS",
 )
 
 JUDGE_LOGIC_FUNCTIONS = (
@@ -109,6 +110,8 @@ JUDGE_LOGIC_FUNCTIONS = (
     "_canon",
     "_number_in",
     "_claim_numbers",
+    "_numeric_values",
+    "_plain_number",
     "_content_words",
     "_load_doc_texts",
     "_judge_excerpt",
@@ -335,8 +338,8 @@ def _quote_supports_claim(claim: str, quote: str, answer: str = "") -> bool:
 def _looks_like_contradiction(claim: str, evidence: str) -> bool:
     if re.search(r"(未|没有|不存在|无).{0,6}(规定|提及|包含|列出|说明|明确)", claim):
         return True
-    claim_nums = set(re.findall(r"\d+(?:\.\d+)?", claim))
-    evidence_nums = set(re.findall(r"\d+(?:\.\d+)?", evidence))
+    claim_nums = _numeric_values(claim)
+    evidence_nums = _numeric_values(evidence)
     if claim_nums and evidence_nums and claim_nums - evidence_nums:
         return True
     if re.search(r"(废止|失效|终止|停止|无效)", claim) and re.search(
@@ -376,12 +379,50 @@ def _key_facts_block(key_facts: list[str]) -> str:
     return "\n".join(f"K{index}. {fact}" for index, fact in enumerate(key_facts, 1))
 
 
-def _number_in(number: str, sentence_norm: str) -> bool:
+_NUMBER_UNITS = {"万": 10000, "亿": 100000000}
+
+
+def _plain_number(value: float) -> str:
+    rounded = round(value, 6)
+    return str(int(rounded)) if rounded.is_integer() else f"{rounded:g}"
+
+
+def _numeric_values(text: str) -> set[float]:
+    """抽取数值并归一单位：2026-09-16 的 09 与 2026年9月16日 的 9 等价，
+    11.1万元 与 111,000元 等价。"""
+    values: set[float] = set()
+    for token, unit in re.findall(
+        r"(\d+(?:[.,]\d+)?)\s*(万|亿)?", _IDENTIFIER_TOKEN.sub(" ", text)
+    ):
+        try:
+            value = float(token.replace(",", ""))
+        except ValueError:
+            continue
+        if unit:
+            value *= _NUMBER_UNITS[unit]
+        values.add(round(value, 6))
+    return values
+
+
+def _number_in(number: str, text: str) -> bool:
+    """text 可以是原文或已规范化文本；内部统一规范化，原文能保留小数与单位。"""
+    text_norm = _norm(text)
     compact = _norm(number.replace(",", ""))
-    if compact in sentence_norm:
+    if compact and compact in text_norm:
         return True
     parts = [part for part in number.replace(",", "").split(".") if part]
-    return len(parts) > 1 and all(_norm(part) in sentence_norm for part in parts)
+    if len(parts) > 1 and all(_norm(part) in text_norm for part in parts):
+        return True
+    # 日期常写成 2026-09-16 / 2026年9月16日，金额常在元与万元之间换算：
+    # 直接按数值比较，避免零填充或单位写法差异被判 missing。
+    try:
+        target = float(number.replace(",", ""))
+    except ValueError:
+        return False
+    return any(
+        abs(value - target) <= max(1e-9, abs(target) * 1e-9)
+        for value in _numeric_values(text)
+    )
 
 
 _IDENTIFIER_TOKEN = re.compile(
@@ -390,8 +431,22 @@ _IDENTIFIER_TOKEN = re.compile(
 
 
 def _claim_numbers(text: str) -> list[str]:
-    """只取独立数量：V1.0、V3.2.2、HR-002、S1 等标识符里的数字不算事实数量。"""
-    return re.findall(r"\d+(?:[.,]\d+)?", _IDENTIFIER_TOKEN.sub(" ", text))
+    """只取独立数量：V1.0、V3.2.2、HR-002、S1 等标识符里的数字不算事实数量。
+    带“万/亿”的数量换算成基本单位，使 11.1万元 与 111,000元 能互相命中。"""
+    numbers: list[str] = []
+    for token, unit in re.findall(
+        r"(\d+(?:[.,]\d+)?)\s*(万|亿)?", _IDENTIFIER_TOKEN.sub(" ", text)
+    ):
+        if unit:
+            try:
+                value = float(token.replace(",", "")) * _NUMBER_UNITS[unit]
+            except ValueError:
+                numbers.append(token)
+            else:
+                numbers.append(_plain_number(value))
+        else:
+            numbers.append(token)
+    return numbers
 
 
 _WORD_STOPWORDS = frozenset("的了和与及为在约而就等都或对将把被于该本属已其中")
@@ -421,9 +476,8 @@ def _word_level_recovery(claim: str, model_answer: str) -> str | None:
     claim_words = _content_words(claim)
     if len(claim_words) < 3:
         return None
-    answer_norm = _canon(model_answer)
     numbers = _claim_numbers(claim)
-    if any(not _number_in(number, answer_norm) for number in numbers):
+    if any(not _number_in(number, model_answer) for number in numbers):
         return None
     answer_words = set(_content_words(model_answer))
     hits = sum(1 for word in claim_words if word in answer_words)
@@ -440,7 +494,7 @@ def _word_level_recovery(claim: str, model_answer: str) -> str | None:
         candidates = [
             window
             for window in windows
-            if all(_number_in(number, _canon(window)) for number in numbers)
+            if all(_number_in(number, window) for number in numbers)
         ] or sentences
     return max(
         candidates,
@@ -484,13 +538,13 @@ def _recovery_window(
     ]
     for window in windows:
         window_norm = _canon(window)
-        if not all(_number_in(number, window_norm) for number in numbers):
+        if not all(_number_in(number, window) for number in numbers):
             continue
         if sum(1 for bigram in bigrams if bigram in window_norm) >= need:
             return window.strip()
     # 数字被拆到间隔较远的多句时（如“2024 立项”“2025-10 终止”），按整篇覆盖率兜底
     whole = _canon(model_answer)
-    if all(_number_in(number, whole) for number in numbers):
+    if all(_number_in(number, model_answer) for number in numbers):
         whole_need = min(len(bigrams), max(2, -(-len(bigrams) * 75 // 100)))
         if sum(1 for bigram in bigrams if bigram in whole) >= whole_need:
             if not sentences:
@@ -1044,7 +1098,6 @@ def evaluate(
             retrieval_calls_total += stats["calls"]
             retrieval_latency_total += stats["elapsed_s"]
             responses.append(attempt)
-        response = responses[0]
         generation_usage = merge_usage(*generation_parts)
         # 生成重复时，检索调用与耗时按全部重复累加，便于换算单次成本
         retrieval_stats = {
@@ -1052,57 +1105,64 @@ def evaluate(
             "elapsed_s": round(retrieval_latency_total, 4),
         }
 
-        retrieved_ids = [hit["metadata"]["doc_id"] for hit in response["hits"]]
         gold_ids = question.get("gold_doc_ids", [])
-        first_rank = next(
-            (rank for rank, doc_id in enumerate(retrieved_ids, 1) if doc_id in gold_ids),
-            None,
-        )
         forbidden_ids = question.get("forbidden_doc_ids", [])
         forbidden_terms = question.get("forbidden_terms", [])
-        leaked_ids = sorted(set(forbidden_ids) & set(retrieved_ids))
-        answer_text = response["answer"]
-        leaked_terms = [term for term in forbidden_terms if term in answer_text]
-        auto_refusal = any(marker in answer_text for marker in REFUSAL_MARKERS)
-        cites_gold = any(doc_id in answer_text for doc_id in gold_ids)
+
+        def _leaked_terms(text: str) -> list[str]:
+            return [term for term in forbidden_terms if term in text]
 
         judged = {
             "score": None, "faithful": None, "refusal_ok": None,
             "permission_ok": None, "reason": "", "facts": [],
             "contradictions": [], "unsupported_claims": [], "refused": None,
         }
-        runs: list[dict] = []
-        sample_scores: list = []
+        round_runs: list[list[dict]] = []
+        round_judgements: list[dict] = []
+        representative = 0
         reset_usage()
         if use_judge:
-            runs = [
-                judge(
-                    question,
-                    answer_text,
-                    context=_judge_excerpt(response["hits"]),
-                    full_docs=_full_docs_context(answer_text, gold_ids),
-                    leaked=bool(leaked_ids or leaked_terms),
+            # 每轮生成都判分；某轮内部重复判分取众数后，再跨轮取众数。
+            # 只判第一轮会让漂移题的基线分数取决于哪一轮恰好排在前面。
+            for candidate in responses:
+                candidate_ids = {
+                    hit["metadata"]["doc_id"] for hit in candidate["hits"]
+                }
+                candidate_leaked = bool(set(forbidden_ids) & candidate_ids) or bool(
+                    _leaked_terms(candidate["answer"])
                 )
-                for _ in range(max(1, judge_repeats))
-            ]
-            judged = _modal_judgement(runs) if len(runs) > 1 else runs[0]
-            sample_scores.append(judged["score"])
-            # 其余生成样本各判一次，用于量化“生成→分数”的漂移
-            for extra in responses[1:]:
-                extra_answer = extra["answer"]
-                extra_judged = judge(
-                    question,
-                    extra_answer,
-                    context=_judge_excerpt(extra["hits"]),
-                    full_docs=_full_docs_context(extra_answer, gold_ids),
-                    leaked=bool(
-                        leaked_ids
-                        or [term for term in forbidden_terms if term in extra_answer]
-                    ),
+                runs = [
+                    judge(
+                        question,
+                        candidate["answer"],
+                        context=_judge_excerpt(candidate["hits"]),
+                        full_docs=_full_docs_context(candidate["answer"], gold_ids),
+                        leaked=candidate_leaked,
+                    )
+                    for _ in range(max(1, judge_repeats))
+                ]
+                round_runs.append(runs)
+                round_judgements.append(
+                    _modal_judgement(runs) if len(runs) > 1 else runs[0]
                 )
-                sample_scores.append(extra_judged["score"])
+            representative = _modal_index(round_judgements)
+            judged = round_judgements[representative]
+        runs = round_runs[representative] if round_runs else []
+        sample_scores = [item["score"] for item in round_judgements]
         judge_usage = usage_snapshot()
         stability = _generation_stability(responses, sample_scores)
+
+        response = responses[representative]
+        retrieved_ids = [hit["metadata"]["doc_id"] for hit in response["hits"]]
+        first_rank = next(
+            (rank for rank, doc_id in enumerate(retrieved_ids, 1) if doc_id in gold_ids),
+            None,
+        )
+        leaked_ids = sorted(set(forbidden_ids) & set(retrieved_ids))
+        answer_text = response["answer"]
+        leaked_terms = _leaked_terms(answer_text)
+        auto_refusal = any(marker in answer_text for marker in REFUSAL_MARKERS)
+        cites_gold = any(doc_id in answer_text for doc_id in gold_ids)
 
         result = {
             "id": question["id"],
@@ -1140,6 +1200,8 @@ def evaluate(
         }
         if repeat_count > 1:
             result["generation_answers"] = [item["answer"] for item in responses]
+            result["generation_scores"] = sample_scores
+            result["generation_representative"] = representative
         if len(runs) > 1:
             result["judge_repeat_scores"] = [run["score"] for run in runs]
         results.append(result)
@@ -1284,15 +1346,20 @@ def _fact_points(
     return points
 
 
+def _modal_index(runs: list[dict]) -> int:
+    """返回众数判分的下标：先按分数，再按事实点状态组合；平票保留最先出现的一轮。"""
+    valid = [index for index, run in enumerate(runs) if run.get("score") is not None]
+    if not valid:
+        return 0
+    score = Counter(runs[index]["score"] for index in valid).most_common(1)[0][0]
+    candidates = [index for index in valid if runs[index]["score"] == score]
+    signature = Counter(_fact_signature(runs[index]) for index in candidates).most_common(1)[0][0]
+    return next(index for index in candidates if _fact_signature(runs[index]) == signature)
+
+
 def _modal_judgement(runs: list[dict]) -> dict:
     """重复判分时取众数：先按分数，再按事实点状态组合，避免单次抖动定分。"""
-    valid = [run for run in runs if run.get("score") is not None]
-    if not valid:
-        return runs[0]
-    score = Counter(run["score"] for run in valid).most_common(1)[0][0]
-    candidates = [run for run in valid if run["score"] == score]
-    signature = Counter(_fact_signature(run) for run in candidates).most_common(1)[0][0]
-    return next(run for run in candidates if _fact_signature(run) == signature)
+    return runs[_modal_index(runs)]
 
 
 def rejudge(
@@ -2310,7 +2377,10 @@ if __name__ == "__main__":
         "--gen-repeats",
         type=int,
         default=1,
-        help="每题重复生成次数，用于统计生成漂移（默认 1；建议 3）",
+        help=(
+            "每题重复生成次数（默认 1）。大于 1 时逐轮判分并取众数写入基线，"
+            "判分调用数为 gen-repeats × judge-repeats"
+        ),
     )
     parser.add_argument(
         "--merge-partial",
