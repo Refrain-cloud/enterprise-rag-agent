@@ -10,9 +10,13 @@ from src.config import (
     GENERATION_MAX_TOKENS_CEILING,
     GENERATION_MAX_TOKENS_HEADER,
     GENERATION_SEED,
+    SESSION_HISTORY_CHARS,
+    SESSION_HISTORY_TURNS,
     STRUCTURED_FIELD_RETRY,
 )
-from src.llm import chat_completion
+from src.llm import chat_completion, stream_chat_completion
+
+from .streaming import emit_delta, emit_reset
 
 SYSTEM_PROMPT = """你是北辰智造科技的内部知识库助手。请严格依据提供的资料回答。
 
@@ -60,16 +64,51 @@ def format_context(hits: list[dict]) -> str:
     return "\n\n".join(blocks)
 
 
+def format_history(
+    history: list[dict] | None,
+    *,
+    max_turns: int = SESSION_HISTORY_TURNS,
+    max_chars: int = SESSION_HISTORY_CHARS,
+) -> str:
+    if not history:
+        return ""
+    selected = history[-max_turns:] if max_turns > 0 else []
+    start = len(history) - len(selected) + 1
+    blocks: list[str] = []
+    used = 0
+    for offset, turn in enumerate(selected):
+        question = CITE_PATTERN.sub("", str(turn.get("question", ""))).strip()
+        answer = CITE_PATTERN.sub("", str(turn.get("answer", ""))).strip()
+        if not question and not answer:
+            continue
+        block = f"第{start + offset}轮 用户：{question}\n第{start + offset}轮 助手：{answer}"
+        separator = 2 if blocks else 0
+        remaining = max_chars - used - separator
+        if remaining <= 0:
+            break
+        if len(block) > remaining:
+            block = block[:remaining]
+        blocks.append(block)
+        used += len(block) + separator
+    return "\n\n".join(blocks)
+
+
 def build_generation_messages(
-    question: str, role: str, hits: list[dict]
+    question: str, role: str, hits: list[dict], history: list[dict] | None = None
 ) -> tuple[list[dict], int]:
     context = format_context(hits)
+    history_text = format_history(history)
+    if history_text:
+        user_content = (
+            f"当前用户角色：{role}\n\n"
+            f"对话历史（仅用于理解指代，不得作为引用来源）：\n{history_text}\n\n"
+            f"参考资料：\n{context}\n\n问题：{question}"
+        )
+    else:
+        user_content = f"当前用户角色：{role}\n\n参考资料：\n{context}\n\n问题：{question}"
     messages = [
         {"role": "system", "content": system_prompt()},
-        {
-            "role": "user",
-            "content": f"当前用户角色：{role}\n\n参考资料：\n{context}\n\n问题：{question}",
-        },
+        {"role": "user", "content": user_content},
     ]
     max_tokens = (
         GENERATION_MAX_TOKENS_HEADER
@@ -205,12 +244,8 @@ def sources(hits: list[dict]) -> list[dict]:
     return list(seen.values())
 
 
-def generate_rag_answer(question: str, role: str, hits: list[dict]) -> dict:
-    """与重构前的 RAG 生成路径逐字一致，供图节点直接复用。"""
-    messages, max_tokens = build_generation_messages(question, role, hits)
-    response, generation_attempts = generate_complete("generate", messages, max_tokens)
-    max_tokens = generation_attempts[-1]["max_tokens"]
-    text = response.choices[0].message.content.strip()
+def _postprocess_text(text: str, hits: list[dict]) -> tuple[str, dict]:
+    text = text.strip()
     stripped = _strip_literal_field_prefix(text)
     literal_prefix_stripped = stripped != text
     text = stripped
@@ -222,13 +257,62 @@ def generate_rag_answer(question: str, role: str, hits: list[dict]) -> dict:
         "remaining": [],
         "literal_prefix_stripped": literal_prefix_stripped,
     }
+    return text, format_check
+
+
+def _complete_blocking(kind: str, messages: list[dict], max_tokens: int):
+    response, attempts = generate_complete(kind, messages, max_tokens)
+    return response.choices[0].message.content, attempts
+
+
+def _complete_streaming(kind: str, messages: list[dict], max_tokens: int):
+    attempts: list[dict] = []
+    while True:
+        if attempts:
+            emit_reset(
+                "truncation_retry",
+                attempt=len(attempts) + 1,
+                max_tokens=max_tokens,
+            )
+        text, finish_reason, _ = stream_chat_completion(
+            kind if not attempts else f"{kind}_truncated_retry",
+            model=CHAT_MODEL,
+            messages=messages,
+            temperature=0,
+            max_tokens=max_tokens,
+            seed=GENERATION_SEED,
+            on_delta=emit_delta,
+        )
+        attempts.append({"max_tokens": max_tokens, "finish_reason": finish_reason})
+        if finish_reason != "length" or max_tokens >= GENERATION_MAX_TOKENS_CEILING:
+            break
+        max_tokens = min(max_tokens * 2, GENERATION_MAX_TOKENS_CEILING)
+    return text, attempts
+
+
+def _generate_answer(
+    question: str,
+    role: str,
+    hits: list[dict],
+    history: list[dict] | None,
+    complete,
+    *,
+    on_reset=None,
+) -> dict:
+    messages, max_tokens = build_generation_messages(question, role, hits, history)
+    raw_text, generation_attempts = complete("generate", messages, max_tokens)
+    max_tokens = generation_attempts[-1]["max_tokens"]
+    text, format_check = _postprocess_text(raw_text, hits)
+    violations = format_check["violations"]
     if violations and STRUCTURED_FIELD_RETRY:
         correction = (
             "上一版回答缺少以下字段名或把字段与其它内容合并："
             f"{'、'.join(violations)}。请保留原有事实与引用，按“字段名：取值”逐行重写，"
             "字段名须与资料表格一致，不得把多个字段合并成一句。"
         )
-        retry, retry_attempts = generate_complete(
+        if on_reset is not None:
+            on_reset("field_retry", max_tokens=max_tokens)
+        retry_raw, retry_attempts = complete(
             "generate_retry",
             [
                 *messages,
@@ -237,10 +321,8 @@ def generate_rag_answer(question: str, role: str, hits: list[dict]) -> dict:
             ],
             max_tokens,
         )
-        retry_text = _strip_literal_field_prefix(
-            retry.choices[0].message.content.strip()
-        )
-        remaining = structured_field_violations(retry_text, hits)
+        retry_text, retry_check = _postprocess_text(retry_raw, hits)
+        remaining = retry_check["violations"]
         format_check.update(
             {
                 "retried": True,
@@ -259,3 +341,18 @@ def generate_rag_answer(question: str, role: str, hits: list[dict]) -> dict:
             "retried_on_truncation": len(generation_attempts) > 1,
         },
     }
+
+
+def generate_rag_answer(
+    question: str, role: str, hits: list[dict], history: list[dict] | None = None
+) -> dict:
+    """与重构前（无历史时）的 RAG 生成路径逐字一致，供图节点直接复用。"""
+    return _generate_answer(question, role, hits, history, _complete_blocking)
+
+
+def generate_rag_answer_stream(
+    question: str, role: str, hits: list[dict], history: list[dict] | None = None
+) -> dict:
+    return _generate_answer(
+        question, role, hits, history, _complete_streaming, on_reset=emit_reset
+    )

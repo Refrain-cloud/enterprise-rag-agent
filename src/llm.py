@@ -5,9 +5,9 @@ import json
 import os
 import threading
 import time
-from typing import Any
+from typing import Any, Callable
 
-from src.config import get_client
+from src.config import STREAM_INCLUDE_USAGE, get_client
 
 # 人民币元 / 百万 tokens，取自阿里云百炼按量计费页（2026-11 核对）。
 # 价格会调整，可用 RAG_PRICE_PER_MILLION 传入 JSON 覆盖，例如
@@ -58,6 +58,7 @@ def record_usage(
     completion_tokens: int = 0,
     total_tokens: int | None = None,
     elapsed_s: float = 0.0,
+    estimated: bool = False,
 ) -> None:
     prompt_tokens = int(prompt_tokens or 0)
     completion_tokens = int(completion_tokens or 0)
@@ -68,6 +69,7 @@ def record_usage(
         "completion_tokens": completion_tokens,
         "total_tokens": int(total_tokens or prompt_tokens + completion_tokens),
         "elapsed_s": round(float(elapsed_s), 4),
+        "estimated": bool(estimated),
     }
     with _LOCK:
         _RECORDS.append(record)
@@ -109,6 +111,96 @@ def chat_completion(kind: str, **kwargs: Any):
     return response
 
 
+def _record_stream_usage(
+    kind: str,
+    model: str,
+    usage: Any,
+    messages: list[dict],
+    text: str,
+    elapsed_s: float,
+) -> None:
+    if usage is not None:
+        record_usage(
+            kind,
+            model,
+            prompt_tokens=getattr(usage, "prompt_tokens", 0) or 0,
+            completion_tokens=getattr(usage, "completion_tokens", 0) or 0,
+            total_tokens=getattr(usage, "total_tokens", None),
+            elapsed_s=elapsed_s,
+        )
+        return
+    # 流式接口没有回传 usage 时按字符数粗略估算，仅用于会话上限与展示
+    prompt_chars = sum(len(str(message.get("content", ""))) for message in messages)
+    record_usage(
+        kind,
+        model,
+        prompt_tokens=max(1, prompt_chars // 2),
+        completion_tokens=max(1, len(text) // 2) if text else 0,
+        elapsed_s=elapsed_s,
+        estimated=True,
+    )
+
+
+def stream_chat_completion(
+    kind: str, *, on_delta: Callable[[str], None], **kwargs: Any
+) -> tuple[str, str | None, dict[str, Any]]:
+    model = kwargs.get("model", "")
+    started = time.perf_counter()
+    parts: list[str] = []
+    finish_reason: str | None = None
+    usage = None
+    include_usage = STREAM_INCLUDE_USAGE
+
+    while True:
+        received = False
+        stream = None
+        try:
+            payload = dict(kwargs)
+            payload["stream"] = True
+            if include_usage:
+                payload["stream_options"] = {"include_usage": True}
+            stream = get_client().chat.completions.create(**payload)
+            for chunk in stream:
+                received = True
+                chunk_usage = getattr(chunk, "usage", None)
+                if chunk_usage is not None:
+                    usage = chunk_usage
+                choices = getattr(chunk, "choices", None) or []
+                if not choices:
+                    continue
+                choice = choices[0]
+                delta = getattr(choice, "delta", None)
+                content = getattr(delta, "content", None) if delta is not None else None
+                if content:
+                    parts.append(content)
+                    on_delta(content)
+                reason = getattr(choice, "finish_reason", None)
+                if reason:
+                    finish_reason = reason
+            break
+        except Exception:
+            # 服务端不支持 stream_options 时（首块之前失败）去掉参数重试一次
+            if include_usage and not received:
+                include_usage = False
+                continue
+            raise
+        finally:
+            close = getattr(stream, "close", None)
+            if callable(close):
+                close()
+
+    text = "".join(parts)
+    _record_stream_usage(
+        kind,
+        model,
+        usage,
+        kwargs.get("messages") or [],
+        text,
+        time.perf_counter() - started,
+    )
+    return text, finish_reason, {"usage_present": usage is not None}
+
+
 def embed(kind: str, **kwargs: Any):
     model = kwargs.get("model", "")
     started = time.perf_counter()
@@ -140,6 +232,7 @@ def _summarize(records: list[dict[str, Any]]) -> dict[str, Any]:
         "total_tokens": sum(record["total_tokens"] for record in records),
         "cost_cny": 0.0,
         "elapsed_s": round(sum(record["elapsed_s"] for record in records), 4),
+        "estimated_calls": sum(1 for record in records if record.get("estimated")),
     }
     unpriced: set[str] = set()
     for record in records:
@@ -193,6 +286,9 @@ def merge_usage(*snapshots: dict[str, Any]) -> dict[str, Any]:
         "elapsed_s": round(
             sum(snapshot.get("elapsed_s", 0.0) for snapshot in snapshots if snapshot), 4
         ),
+        "estimated_calls": sum(
+            snapshot.get("estimated_calls", 0) for snapshot in snapshots if snapshot
+        ),
         "by_kind": {name: _merge_summaries(items) for name, items in sorted(by_kind.items())},
         "by_model": {name: _merge_summaries(items) for name, items in sorted(by_model.items())},
     }
@@ -209,6 +305,7 @@ def _merge_summaries(items: list[dict[str, Any]]) -> dict[str, Any]:
         "total_tokens": sum(item.get("total_tokens", 0) for item in items),
         "cost_cny": round(sum(item.get("cost_cny", 0.0) for item in items), 6),
         "elapsed_s": round(sum(item.get("elapsed_s", 0.0) for item in items), 4),
+        "estimated_calls": sum(item.get("estimated_calls", 0) for item in items),
     }
     unpriced: set[str] = set()
     for item in items:

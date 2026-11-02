@@ -34,7 +34,7 @@ FAKE_RESULT = {
 }
 
 
-def fake_answer(question, role="普通员工", top_k=12, request_id=None):
+def fake_answer(question, role="普通员工", top_k=12, request_id=None, **kwargs):
     return dict(FAKE_RESULT)
 
 

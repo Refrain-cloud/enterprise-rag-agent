@@ -94,6 +94,9 @@ def _to_result(state: AgentState) -> dict:
 
     answer = result.get("answer", "")
     result["citations"] = sorted(set(CITE_PATTERN.findall(answer)))
+    result["rewritten_question"] = state.get("rewritten_question") or state.get(
+        "question", ""
+    )
     result["self_check"] = state.get("self_check", {})
     result["trace"] = state.get("trace", [])
     result["rewrite"] = state.get("rewrite", {})
@@ -112,6 +115,11 @@ def run_agent(
     top_k: int = TOP_K,
     debug: bool = False,
     request_id: str | None = None,
+    *,
+    history: list[dict] | None = None,
+    session_id: str | None = None,
+    turn_index: int = 0,
+    stream_sink=None,
 ) -> dict:
     started = time.perf_counter()
     state = initial_state(
@@ -120,6 +128,10 @@ def run_agent(
         top_k,
         debug=debug,
         request_id=request_id,
+        history=history,
+        session_id=session_id,
+        turn_index=turn_index,
+        stream_sink=stream_sink,
     )
     final_state = get_graph().invoke(state)
     result = _to_result(final_state)

@@ -71,6 +71,22 @@ API_MAX_CONCURRENCY = int(os.getenv("RAG_API_MAX_CONCURRENCY", "4"))
 API_QUEUE_TIMEOUT_S = float(os.getenv("RAG_API_QUEUE_TIMEOUT_S", "5"))
 API_REQUEST_TIMEOUT_S = float(os.getenv("RAG_API_REQUEST_TIMEOUT_S", "120"))
 
+# 多轮会话：内存存储，服务重启即清空
+SESSION_TTL_S = float(os.getenv("RAG_SESSION_TTL_S", "1800"))
+SESSION_MAX_TURNS = int(os.getenv("RAG_SESSION_MAX_TURNS", "10"))
+SESSION_MAX_TOKENS = int(os.getenv("RAG_SESSION_MAX_TOKENS", "100000"))
+SESSION_MAX_COST_CNY = float(os.getenv("RAG_SESSION_MAX_COST_CNY", "0.5"))
+SESSION_MAX_COUNT = int(os.getenv("RAG_SESSION_MAX_COUNT", "500"))
+SESSION_HISTORY_TURNS = int(os.getenv("RAG_SESSION_HISTORY_TURNS", "3"))
+SESSION_HISTORY_CHARS = int(os.getenv("RAG_SESSION_HISTORY_CHARS", "1200"))
+SESSION_ANSWER_CHARS = int(os.getenv("RAG_SESSION_ANSWER_CHARS", "400"))
+FOLLOWUP_REWRITE = os.getenv("RAG_FOLLOWUP_REWRITE", "1") not in {"0", "false", "False"}
+FOLLOWUP_MAX_TOKENS = int(os.getenv("RAG_FOLLOWUP_MAX_TOKENS", "80"))
+
+# 流式输出
+STREAM_INCLUDE_USAGE = os.getenv("RAG_STREAM_INCLUDE_USAGE", "1") not in {"0", "false", "False"}
+STREAM_HEARTBEAT_S = float(os.getenv("RAG_STREAM_HEARTBEAT_S", "15"))
+
 
 def get_api_key() -> str:
     key = os.getenv("DASHSCOPE_API_KEY") or os.getenv("OPENAI_API_KEY")

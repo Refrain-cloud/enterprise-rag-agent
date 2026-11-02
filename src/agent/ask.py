@@ -11,8 +11,22 @@ def answer(
     role: str = "普通员工",
     top_k: int = TOP_K,
     request_id: str | None = None,
+    *,
+    history: list[dict] | None = None,
+    session_id: str | None = None,
+    turn_index: int = 0,
+    stream_sink=None,
 ) -> dict:
-    return run_agent(question, role=role, top_k=top_k, request_id=request_id)
+    return run_agent(
+        question,
+        role=role,
+        top_k=top_k,
+        request_id=request_id,
+        history=history,
+        session_id=session_id,
+        turn_index=turn_index,
+        stream_sink=stream_sink,
+    )
 
 
 def main() -> None:

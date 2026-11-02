@@ -23,6 +23,12 @@ class AgentState(TypedDict, total=False):
     request_id: str
     started_at: float
 
+    history: list[dict]
+    rewritten_question: str
+    session_id: str
+    turn_index: int
+    stream_sink: Any
+
     hits: list[dict]
     best_overall: list[dict]
     retrieval_calls: int
@@ -51,16 +57,29 @@ def initial_state(
     top_k: int,
     debug: bool = False,
     request_id: str | None = None,
+    *,
+    history: list[dict] | None = None,
+    session_id: str | None = None,
+    turn_index: int = 0,
+    stream_sink: Any = None,
 ) -> AgentState:
-    return {
+    state: AgentState = {
         "question": question,
         "role": role,
         "top_k": top_k,
         "debug": debug,
         "request_id": request_id or uuid.uuid4().hex[:12],
         "started_at": time.time(),
+        "turn_index": turn_index,
         "trace": [],
     }
+    if history:
+        state["history"] = list(history)
+    if session_id:
+        state["session_id"] = session_id
+    if stream_sink is not None:
+        state["stream_sink"] = stream_sink
+    return state
 
 
 def trace_event(

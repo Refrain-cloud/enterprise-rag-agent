@@ -5,6 +5,8 @@ import time
 from src.config import (
     AGG_TOP_K,
     CHAT_MODEL,
+    FOLLOWUP_MAX_TOKENS,
+    FOLLOWUP_REWRITE,
     GENERATION_SEED,
     REWRITE_MAX_TOKENS,
     REWRITE_ON_EMPTY,
@@ -24,10 +26,13 @@ from src.tools.sql_tool import (
 from .runtime import (
     CITE_PATTERN,
     ensure_draft_disclosure,
+    format_history,
     generate_rag_answer,
+    generate_rag_answer_stream,
     sources,
 )
 from .state import AgentState, trace_event
+from .streaming import current_sink, emit_status
 
 DENIED_ANSWER = "该信息属于公司机密，当前角色无权访问。"
 NOT_FOUND_ANSWER = "知识库中没有找到与该问题相关且你有权访问的资料，无法回答。"
@@ -36,22 +41,69 @@ REWRITE_SYSTEM_PROMPT = """你是知识库检索查询改写助手。把用户�
 补全指代和省略信息，保留专有名词、编号、日期、部门名与业务术语，可以补充同义词；
 不要回答问题，不要解释，不要加引号，只输出一行改写后的查询。"""
 
+FOLLOWUP_SYSTEM_PROMPT = """你是知识库检索查询改写助手。结合给定的对话历史，把最后一条问题改写成一个不依赖上下文、可独立检索的完整问题：
+补全代词与省略信息，保留专有名词、编号、日期、部门名与业务术语；历史仅用于消歧，不要回答问题；
+不要解释，不要加引号，只输出一行改写后的查询。"""
+
 
 def _doc_ids(hits: list[dict], limit: int = 8) -> list[str]:
     return [hit["metadata"].get("doc_id", "") for hit in hits[:limit]]
 
 
+def _rewrite_followup(question: str, history: list[dict]) -> str | None:
+    history_text = format_history(history)
+    if not history_text:
+        return None
+    try:
+        response = chat_completion(
+            "rewrite_followup",
+            model=CHAT_MODEL,
+            messages=[
+                {"role": "system", "content": FOLLOWUP_SYSTEM_PROMPT},
+                {
+                    "role": "user",
+                    "content": f"对话历史：\n{history_text}\n\n当前问题：{question}",
+                },
+            ],
+            temperature=0,
+            max_tokens=FOLLOWUP_MAX_TOKENS,
+            seed=GENERATION_SEED,
+        )
+        text = response.choices[0].message.content.strip().strip("\"'“”")
+    except Exception:
+        return None
+    first_line = text.splitlines()[0].strip() if text else ""
+    return first_line or None
+
+
 def prepare_node(state: AgentState) -> dict:
     started = time.perf_counter()
+    emit_status("prepare", "start")
     role = normalize_role(state.get("role", "普通员工"))
+    history = state.get("history") or []
+    rewritten = state["question"]
+    followup = {"triggered": False, "succeeded": False, "query": None}
+    if history and FOLLOWUP_REWRITE:
+        followup["triggered"] = True
+        candidate = _rewrite_followup(state["question"], history)
+        followup["query"] = candidate
+        if candidate and candidate != state["question"]:
+            rewritten = candidate
+            followup["succeeded"] = True
     return {
         "role": role,
+        "rewritten_question": rewritten,
         "trace": [
             trace_event(
                 state,
                 "prepare",
                 started,
-                summary={"role": role, "top_k": state.get("top_k", TOP_K)},
+                summary={
+                    "role": role,
+                    "top_k": state.get("top_k", TOP_K),
+                    "history_turns": len(history),
+                    "followup_rewrite": followup,
+                },
             )
         ],
     }
@@ -75,7 +127,8 @@ def _rewrite_query(question: str) -> str:
 
 def retrieve_node(state: AgentState) -> dict:
     started = time.perf_counter()
-    question = state["question"]
+    emit_status("retrieve", "start")
+    question = state.get("rewritten_question") or state["question"]
     role = state["role"]
     top_k = state.get("top_k", TOP_K)
 
@@ -108,6 +161,7 @@ def retrieve_node(state: AgentState) -> dict:
             hits = hybrid_search(rewritten, role=role, top_k=top_k)
             rewrite["succeeded"] = bool(hits)
 
+    emit_status("retrieve", "done", hits=len(hits), calls=calls)
     return {
         "hits": hits,
         "best_overall": best_overall,
@@ -136,6 +190,7 @@ def guard_node(state: AgentState) -> dict:
     role = state["role"]
 
     def denied() -> dict:
+        emit_status("guard", "done", status="denied")
         return {
             "terminal": "denied",
             "answer": DENIED_ANSWER,
@@ -158,6 +213,7 @@ def guard_node(state: AgentState) -> dict:
                     )
                 ],
             }
+        emit_status("guard", "done", status="not_found")
         return {
             "terminal": "not_found",
             "answer": NOT_FOUND_ANSWER,
@@ -190,6 +246,7 @@ def guard_node(state: AgentState) -> dict:
                 ],
             }
 
+    emit_status("guard", "done", status="passed", hits=len(hits))
     return {
         "trace": [
             trace_event(
@@ -204,11 +261,10 @@ def guard_node(state: AgentState) -> dict:
 
 def route_node(state: AgentState) -> dict:
     started = time.perf_counter()
-    decision = (
-        "structured"
-        if TABLE_TOOL_ENABLED and is_aggregation_question(state["question"])
-        else "rag"
-    )
+    question = state.get("rewritten_question") or state["question"]
+    aggregation = is_aggregation_question(question)
+    decision = "structured" if TABLE_TOOL_ENABLED and aggregation else "rag"
+    emit_status("route", "done", decision=decision)
     return {
         "route_decision": decision,
         "trace": [
@@ -216,10 +272,7 @@ def route_node(state: AgentState) -> dict:
                 state,
                 "route",
                 started,
-                summary={
-                    "decision": decision,
-                    "aggregation": is_aggregation_question(state["question"]),
-                },
+                summary={"decision": decision, "aggregation": aggregation},
             )
         ],
     }
@@ -227,7 +280,7 @@ def route_node(state: AgentState) -> dict:
 
 def structured_node(state: AgentState) -> dict:
     started = time.perf_counter()
-    question = state["question"]
+    question = state.get("rewritten_question") or state["question"]
     role = state["role"]
     hits = state.get("hits") or []
 
@@ -236,6 +289,7 @@ def structured_node(state: AgentState) -> dict:
         tool_result = answer_with_scanned_tables(question, role, hits)
 
     if not tool_result:
+        emit_status("structured", "done", status="fallback")
         return {
             "tool_result": None,
             "trace": [
@@ -255,6 +309,12 @@ def structured_node(state: AgentState) -> dict:
         [hit for hit in hits if hit["metadata"]["doc_id"] in used_doc_ids]
     )
     tool_result["denied"] = False
+    emit_status(
+        "structured",
+        "done",
+        tool=tool_result.get("route", "sql"),
+        doc_ids=sorted(used_doc_ids),
+    )
     return {
         "tool_result": tool_result,
         "answer": tool_result["answer"],
@@ -276,10 +336,16 @@ def structured_node(state: AgentState) -> dict:
 
 def generate_node(state: AgentState) -> dict:
     started = time.perf_counter()
+    emit_status("generate", "start", hits=len(state.get("hits") or []))
     question = state["question"]
     role = state["role"]
     hits = state.get("hits") or []
-    generated = generate_rag_answer(question, role, hits)
+    if state.get("stream_sink") is not None or current_sink() is not None:
+        generated = generate_rag_answer_stream(
+            question, role, hits, state.get("history")
+        )
+    else:
+        generated = generate_rag_answer(question, role, hits, state.get("history"))
     return {
         "answer": generated["text"],
         "sources": sources(hits),
