@@ -59,17 +59,6 @@ h1 {
   color: var(--muted);
 }
 
-.stage-badge {
-  flex: none;
-  padding: 6px 12px;
-  border: 1px solid #c9d5ff;
-  border-radius: 999px;
-  background: var(--accent-soft);
-  color: var(--accent);
-  font-size: 12px;
-  font-weight: 700;
-}
-
 .panel {
   background: var(--panel);
   border: 1px solid var(--line);
@@ -479,7 +468,6 @@ button.ghost:hover {
 @media (max-width: 640px) {
   .page { padding-top: 24px; }
   .masthead { flex-direction: column; }
-  .stage-badge { align-self: flex-start; }
   .toggle { margin-left: 0; }
   .actions { align-items: stretch; flex-direction: column; }
   button[type="button"] { width: 100%; }
