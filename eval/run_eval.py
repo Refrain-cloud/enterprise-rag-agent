@@ -170,6 +170,9 @@ ABSENCE_REFUSAL_MARKERS = [
     "不存在", "未提及", "已终止", "没有下一阶段", "无下一阶段",
     "没有相关信息", "无相关信息",
     "未最终确定", "尚未确定", "未确定是否", "尚未最终确定",
+    "没有确定", "未形成最终结论", "未形成结论", "没有形成结论",
+    "未形成明确结论", "没有明确结论", "未明确结论", "尚无结论", "无最终结论",
+    "没有给出结论", "未给出结论",
     "无法从现有资料", "无法从资料", "无法确证", "未在正文中列出", "未随文归档",
 ]
 
@@ -191,6 +194,7 @@ JUDGE_PROMPT = """你是 RAG 评估中的事实提取员，只做核对，不评
    - wrong：回答写了，但与标准答案或资料矛盾。
    - 判定以语义为准：允许同义改写、语序调整，也允许同一事实拆到多句或与相邻句合并；只要回答正文表达了该事实的全部要素（主体、数字、日期、结论、条件）即记 covered；只覆盖部分要素才记 missing。
    - 若一条必答事实点包含多个独立要素（由“且/并/以及/；/同时”连接），须逐要素核对：全部要素都在回答中出现才记 covered，缺少任一要素记 missing。回答把这些要素分散在不同句子时，quote 可用“……”连接多个逐字片段，每个片段都必须能在回答中逐字找到。
+   - 若必答事实点限定了版本、文件或时点，回答前文虽提到该值，但最终汇总或结论改用其他版本、文件的值，或给出相反结论，记 wrong（quote 引用最终汇总中的相反表述），不能只凭前文出现就记 covered。
    - covered 和 wrong 必须给出 quote：只从最后的“助手回答”中逐字复制支撑片段，不要改写、不要加引号，也不要从检索片段或文件全文中复制。quote 无法在回答中逐字匹配时，按 missing 处理。
    - 如果回答只是复述资料原文、没有针对该事实作出表述，也不能算 covered。
 3. contradictions 只记录回答与检索片段或文件全文直接冲突的陈述；evidence 必须逐字引用冲突原文。找不到直接冲突原文时，contradictions 必须为空。禁止根据制度效力层级、法律解释、“一般条款隐含”等推理判定冲突。
@@ -199,7 +203,7 @@ JUDGE_PROMPT = """你是 RAG 评估中的事实提取员，只做核对，不评
    矛盾必须是两个陈述相互对立。如果回答与 evidence 表达同一结论（例如两者都说某文件已废止），这不是矛盾，不要记录。
    示例：回答称“某制度未重新规定住宿标准”，而该制度全文表格中列有该标准 → 记冲突，evidence 逐字引用该表格行。
    示例：回答称“某文件未对某情形作特别规定”，而全文确实没有该情形的专条 → 不记冲突。
-4. refused：回答是否明确表示无法回答、无权访问或信息不存在，而不是给出实质答案。明确说明所问信息不存在、数量为零或公司不具备该属性（如“公司无股票代码”“未设立海外分支机构”），且没有编造具体值，也属于 refused。
+4. refused：回答是否明确表示无法回答、无权访问或信息不存在，而不是给出实质答案。明确说明所问信息不存在、数量为零或公司不具备该属性（如“公司无股票代码”“未设立海外分支机构”），且没有编造具体值，也属于 refused。资料只记录“没有确定/未明确/未形成结论/约定下次再问”，且回答没有给出确定答案，也属于 refused。
 5. 只核对，不要输出分数、理由或建议。
 
 评估对象：
@@ -326,10 +330,23 @@ def _quote_supports_claim(claim: str, quote: str, answer: str = "") -> bool:
         return False
     # 括号内是计算过程/补充说明，按提示词规则不参与 token 校验
     claim_for_tokens = re.sub(r"[（(][^（）()]*[）)]", "", claim).strip() or claim
-    tokens = re.findall(r"[A-Za-z0-9]+", claim_for_tokens)
+    identifiers = re.findall(_IDENTIFIER_TOKEN, claim_for_tokens)
+    remaining = _IDENTIFIER_TOKEN.sub(" ", claim_for_tokens)
+    tokens = (
+        identifiers
+        + re.findall(r"[A-Za-z]+", remaining)
+        + _claim_numbers(claim_for_tokens)
+    )
     if tokens:
-        scope = _canon(answer) if answer else quote_norm
-        return all(_canon(token) in scope for token in tokens)
+        scope_text = answer or quote
+        scope = _canon(scope_text)
+        for token in tokens:
+            if re.fullmatch(r"\d+(?:[.,]\d+)?", token):
+                if not _number_in(token, scope_text):
+                    return False
+            elif _canon(token) not in scope:
+                return False
+        return True
     if len(claim_norm) <= 2:
         return claim_norm in quote_norm
     if claim_norm in quote_norm:
@@ -408,20 +425,12 @@ def _numeric_values(text: str) -> set[float]:
 
 
 def _number_in(number: str, text: str) -> bool:
-    """text 可以是原文或已规范化文本；内部统一规范化，原文能保留小数与单位。"""
-    text_norm = _norm(text)
+    """按独立数值比较，避免“10”命中日期 2024-01-01 这类相邻数字子串。"""
     compact = _norm(number.replace(",", ""))
-    if compact and compact in text_norm:
-        return True
-    parts = [part for part in number.replace(",", "").split(".") if part]
-    if len(parts) > 1 and all(_norm(part) in text_norm for part in parts):
-        return True
-    # 日期常写成 2026-09-16 / 2026年9月16日，金额常在元与万元之间换算：
-    # 直接按数值比较，避免零填充或单位写法差异被判 missing。
     try:
         target = float(number.replace(",", ""))
     except ValueError:
-        return False
+        return bool(compact and compact in _norm(text))
     return any(
         abs(value - target) <= max(1e-9, abs(target) * 1e-9)
         for value in _numeric_values(text)
