@@ -129,6 +129,38 @@ curl -N -X POST http://127.0.0.1:8000/api/ask/stream \
 | `RAG_TABLE_TOOL` | `1` | 结构化工具开关 |
 | `RAG_MAX_TOKENS` | `900` | 生成预算，截断后逐级放宽 |
 
+## Docker
+
+镜像只打包依赖、`src/` 与只读的 `data/`；`build/` 中的语料和索引不烘焙进镜像，运行时挂载宿主机的 `build/`。
+
+```bash
+# 1) 宿主机先构建索引（需要 DASHSCOPE_API_KEY）
+python -m src.ingest.build_corpus
+python -m src.retrieval.index --rebuild
+
+# 2) 构建镜像
+docker build -t beichen-rag:dev .
+
+# 3) 启动；配置通过 --env-file 注入，索引通过 volume 挂载
+docker run --rm -p 8000:8000 \
+  --env-file .env \
+  -v "$(pwd)/build:/app/build" \
+  beichen-rag:dev
+```
+
+Windows Git Bash 会转换 `-v` 里的路径，改用：
+
+```bash
+docker run --rm -p 8000:8000 --env-file .env \
+  -v "$(cygpath -w "$(pwd)/build"):/app/build" beichen-rag:dev
+```
+
+浏览器打开 `http://127.0.0.1:8000`。容器以非 root 用户（uid 10001）运行，Linux 宿主机需保证 `build/` 对其可读。`/api/health` 在索引预热完成后返回 `index_ready: true`，镜像自带 `HEALTHCHECK`。
+
+- 索引必须与镜像使用相同的 embedding 模型和维度；换模型后要在宿主机重建索引。
+- `.env` 不要挂载进容器；`--env-file` 只支持 `KEY=VALUE` 与注释，与 `.env.example` 格式一致。
+- Docker Hub 不可达时，先通过可用镜像源拉取 `python:3.14-slim` 并在本地打标签，构建时可用 `--build-arg PIP_INDEX_URL=...` 指定 PyPI 索引。这些属于环境配置，不写入项目依赖。
+
 ## 评估
 
 ### 数据集
@@ -259,6 +291,7 @@ python -m unittest discover -s tests -v
 ## 目录结构
 
 ```text
+Dockerfile      容器镜像；build/ 通过 volume 挂载，不烘焙进镜像
 data/kb/        只读知识库快照（273 份文档 + 清单）
 src/
   ingest/       解析、元数据、OCR
